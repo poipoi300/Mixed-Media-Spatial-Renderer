@@ -1,0 +1,64 @@
+# The viewer API
+
+The viewer holds no knowledge of what its data means: it renders whatever an
+HTTP server describes. This is that contract. `crates/shape_api` is a complete,
+small reference implementation, and `crates/generation_api` holds the shared
+wire types.
+
+Three endpoints drive the viewer. Any server that implements them can drive it;
+`crates/shape_api` is a complete one that arranges a folder of media into 3D
+shapes:
+
+```powershell
+cargo run --release -p shape_api -- --port 8766
+cargo run --release -p generation_viewer -- --api http://127.0.0.1:8766
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | `{"status": "ok"}` |
+| `POST /catalog/stream` | NDJSON snapshots; a server may send exactly one |
+| `POST /projection` | one snapshot, for a control change |
+
+Both POSTs take the same body: the folder roots the start menu picked, every
+control value, and the id of the control the user activated (which is what
+distinguishes a button press from a value change). Nothing is kept per client,
+so a reconnect cannot desynchronize.
+
+A snapshot answers with the points **and** the panel whose controls produced
+them, so the pill always describes what is on screen:
+
+```json
+{"kind": "snapshot", "complete": true, "roots": ["..."],
+ "panel": {"revision": 1, "summary": "Sphere  120 pts",
+           "stats": [{"label": "shown", "value": "120 / 500"}],
+           "error": null, "widgets": [ ... ]},
+ "projection": {"axis_labels": ["Longitude", "Latitude", "Depth"],
+                "total": 500, "points": [ ... ]}}
+```
+
+`axis_labels` is what the gizmo and billboard coordinate labels display — the
+server names its own axes, so the viewer needs no notion of what produced the
+layout.
+
+**Widgets.** Six kinds: `group` (nests, optionally collapsible), `select`,
+`button`, `slider`, `text` and `toggle`. Each leaf carries an `id`, a `label`,
+its current `value`, and optionally `detail` and `disabled`.
+
+**`submits` is how a server declares its apply model.** Interacting with a
+`submits: true` widget sends the request; a `submits: false` widget only
+updates the viewer's local values until something else submits. So apply-on-
+change is every widget submitting, and a submit-style form is a run of
+non-submitting fields plus one submitting button. The pill marks any control
+edited since the last submission, so an unsent form is never mistaken for
+applied state.
+
+**`revision`** changes only when the widget *structure* does — one added,
+removed, reordered, or its kind changed. Values, stats, labels and errors move
+freely without it. The viewer rebuilds its widget entities when it changes, so
+a server that bumps it needlessly makes the panel flicker.
+
+Two error paths, both needed: `panel.error` is the server rejecting the values
+it was sent (the scene stays as it was), while `{"kind": "error", "message":
+"..."}` ends a stream.
+

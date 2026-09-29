@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/generation_api",
+    "crates/generation_geometry",
+    "crates/generation_viewer_ui",
+    "crates/generation_viewer",
+    "crates/shape_api",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.89"

@@ -1,0 +1,12 @@
+[package]
+name = "generation_geometry"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Only Vec3 is needed here; depending on bevy_math directly keeps this
+# crate (and its tests) free of the full engine.
+bevy_math = { version = "0.15.3" }
+generation_api = { path = "../generation_api" }

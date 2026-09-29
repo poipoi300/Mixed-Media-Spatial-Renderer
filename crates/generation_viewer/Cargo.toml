@@ -1,0 +1,38 @@
+[package]
+name = "generation_viewer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ab_glyph = "0.2"
+anyhow = "1"
+# The system clipboard, for the context menu's "Copy path".
+arboard = { version = "3", default-features = false }
+# Platform folder lookups (the Pictures folder, wherever the OS redirects it)
+# for frames saved from the context menu.
+dirs = "6"
+# Already in the build through Bevy. Its receivers are `Sync`, so a playing
+# video's frame stream can live in an ECS resource.
+crossbeam-channel = "0.5"
+bevy = { version = "0.15.3", default-features = true }
+generation_api = { path = "../generation_api" }
+generation_geometry = { path = "../generation_geometry" }
+generation_viewer_ui = { path = "../generation_viewer_ui" }
+image = { version = "0.24.9", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
+# BC7 block compression for billboard textures: the GPU samples it natively
+# at 1 byte/px instead of 4. Ships prebuilt ISPC static libraries, so no
+# ISPC toolchain is needed to build.
+intel_tex_2 = "0.5"
+# Matches the rodio version bevy_audio 0.15 already pulls in; used directly so
+# video sound can play from a custom streamed source that reports how far it
+# played, which the bevy_audio asset API cannot do.
+rodio = { version = "0.19", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Decodes BC7 back to RGBA so the round-trip test can measure real error
+# rather than assert that the encoder returned some bytes.
+bcdec_rs = "0.2"
