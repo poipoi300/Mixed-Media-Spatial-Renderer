@@ -269,12 +269,9 @@ fn main() -> Result<()> {
     let client = GenerationApiClient::new(&args.api);
     let health = client
         .health()
-        .with_context(|| format!("Failed to reach Generation Explorer API at {}", args.api))?;
+        .with_context(|| format!("Failed to reach viewer API at {}", args.api))?;
     if health.status != "ok" {
-        bail!(
-            "Generation Explorer API returned non-ok status: {}",
-            health.status
-        );
+        bail!("Viewer API returned non-ok status: {}", health.status);
     }
 
     let image_world_size = billboard_world_size(args.spacing, args.billboard_scale);
@@ -408,7 +405,7 @@ fn main() -> Result<()> {
                 })
                 .set(WindowPlugin {
                     primary_window: Some(Window {
-                        title: "Generation Explorer Bevy Viewer".to_owned(),
+                        title: "Mixed Media Spatial Renderer".to_owned(),
                         resolution: (1600.0, 1000.0).into(),
                         resize_constraints: WindowResizeConstraints {
                             min_width: MIN_WINDOW_WIDTH,

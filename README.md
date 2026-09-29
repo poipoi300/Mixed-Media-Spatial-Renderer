@@ -1,4 +1,4 @@
-# Generation Viewer
+# Mixed Media Spatial Renderer
 
 A 3D viewer for large collections of images and videos, built with
 [Bevy](https://bevyengine.org/). Every file becomes a billboard placed in space,

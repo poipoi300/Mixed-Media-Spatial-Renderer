@@ -115,7 +115,7 @@ where
 fn print_help() {
     println!(
         "\
-Generation Explorer Bevy Viewer
+Mixed Media Spatial Renderer
 
 USAGE:
     generation_viewer [OPTIONS]

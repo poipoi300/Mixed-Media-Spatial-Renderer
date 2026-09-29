@@ -39,7 +39,7 @@ const AUDIO_DELAY_STEP_MS: i32 = 50;
 const SUBTITLE_DELAY_STEP_MS: i32 = 100;
 /// Delays past this are a wrong file, not a sync fix.
 const MAX_DELAY_MS: i32 = 10_000;
-const SCREENSHOT_DIRECTORY_NAME: &str = "Generation Viewer";
+const SCREENSHOT_DIRECTORY_NAME: &str = "Mixed Media Spatial Renderer";
 
 /// A right press released over the world before it became a look-drag.
 #[derive(Event, Clone, Copy, Debug)]

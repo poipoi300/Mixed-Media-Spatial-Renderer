@@ -2298,7 +2298,7 @@ fn spawn_start_overlay(parent: &mut ChildBuilder) {
             overlay
                 .spawn(menu_panel(ViewerUiPanel::StartOverlay, 460.0))
                 .with_children(|menu| {
-                    spawn_menu_header_with_back(menu, "Generation Explorer");
+                    spawn_menu_header_with_back(menu, "Mixed Media Spatial Renderer");
                     spawn_text(menu, ViewerUiText::StartStatus);
                     for row_index in 0..START_MENU_FOLDER_ROWS {
                         spawn_start_folder_row(menu, row_index);

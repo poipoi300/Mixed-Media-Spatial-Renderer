@@ -1,10 +1,10 @@
 //! A minimal server for the viewer, arranging local media into 3D shapes.
 //!
 //! This exists to show that the viewer's API is not shaped around the
-//! generation explorer. It has no concept of dimensions or axes; it publishes
-//! a shape dropdown, a radius slider, a jitter toggle, a seed field and a
-//! randomize button, and the viewer renders exactly those because a server
-//! describes its own controls.
+//! server it was first written against. It has no concept of dimensions or
+//! axes; it publishes a shape dropdown, a radius slider, a jitter toggle, a
+//! seed field and a randomize button, and the viewer renders exactly those
+//! because a server describes its own controls.
 //!
 //! The whole contract is three endpoints:
 //!
