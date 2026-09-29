@@ -1,7 +1,7 @@
 //! Opt-in, rendered performance emulation used by `tests/performance/run.py`.
 //!
 //! The harness is absent from normal viewer runs.  Setting
-//! `GENERATION_VIEWER_PERF_CONFIG` to a JSON config file enables a seeded
+//! `SPATIAL_VIEWER_PERF_CONFIG` to a JSON config file enables a seeded
 //! action timeline, per-second JSONL telemetry, state assertions, and a clean
 //! exit at the requested duration.  Process-level CPU and memory are sampled
 //! by the Python parent so child ffmpeg processes are included as well.
@@ -18,8 +18,8 @@ use bevy::{
     app::AppExit, ecs::system::SystemParam, input::InputSystem, prelude::*,
     transform::TransformSystem, ui::UiSystem,
 };
-use generation_geometry::Bounds3;
-use generation_viewer_ui::{
+use spatial_geometry::Bounds3;
+use spatial_viewer_ui::{
     BillboardControls, BillboardStats, ControlPanelState, NavigationSettings, PauseMenuState,
     StartMenuState, MIN_TEXTURE_BUDGET_MIB,
 };
@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 
 use crate::{
     audio_stream::AudioPlaybackState,
-    image_loading::GenerationBillboard,
+    image_loading::MediaBillboard,
     media_probe::MediaProbes,
     media_settings::MediaSettings,
     video_controls::{start_video, VideoStart},
@@ -40,8 +40,8 @@ use crate::{
     ExplorerScene, FlyCamera, VideoControlsState,
 };
 
-pub const PERF_CONFIG_ENV: &str = "GENERATION_VIEWER_PERF_CONFIG";
-pub const PERF_ROOTS_ENV: &str = "GENERATION_VIEWER_PERF_ROOTS";
+pub const PERF_CONFIG_ENV: &str = "SPATIAL_VIEWER_PERF_CONFIG";
+pub const PERF_ROOTS_ENV: &str = "SPATIAL_VIEWER_PERF_ROOTS";
 
 #[derive(Debug, Clone, Deserialize)]
 struct HarnessConfig {
@@ -596,7 +596,7 @@ fn drive_timeline(
     mut video: HarnessVideo,
     navigation: Option<Res<NavigationSettings>>,
     mut camera: Query<(&mut Transform, &mut FlyCamera)>,
-    billboards: Query<&GenerationBillboard>,
+    billboards: Query<&MediaBillboard>,
 ) {
     let elapsed = harness.elapsed();
     let grace = harness.config.assertion_grace_seconds.max(0.5);
@@ -777,7 +777,7 @@ fn drive_timeline(
                         for (control_id, value) in REPROJECT_AXIS_VALUES {
                             controls.set_value(
                                 control_id,
-                                generation_api::ControlValue::Text((*value).to_owned()),
+                                spatial_api::ControlValue::Text((*value).to_owned()),
                             );
                         }
                         action.status = ActionStatus::Checking {

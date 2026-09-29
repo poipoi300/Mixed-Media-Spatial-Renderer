@@ -1,5 +1,5 @@
 use bevy_math::Vec3;
-use generation_api::ProjectionPoint;
+use spatial_api::ProjectionPoint;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bounds3 {

@@ -19,12 +19,12 @@ use std::{
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
-use generation_viewer_ui::{
+use spatial_viewer_ui::{
     ContextMenu, ContextMenuItem, ContextMenuModel, ContextMenuOption, ContextMenuSection,
     PauseMenuState, RenderResolutionSettings,
 };
 
-use crate::image_loading::GenerationBillboard;
+use crate::image_loading::MediaBillboard;
 use crate::manual_spacing::{cursor_world_ray, nearest_billboard_hit};
 use crate::media_decode::{still_frame_arguments, VideoSource};
 use crate::media_probe::{MediaInfo, MediaProbe, MediaProbes};
@@ -114,7 +114,7 @@ pub(crate) fn open_billboard_menu(
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<FlyCamera>>,
     strip_parts: VideoStripHitQuery,
-    billboards: Query<(&GenerationBillboard, &GlobalTransform, &Visibility)>,
+    billboards: Query<(&MediaBillboard, &GlobalTransform, &Visibility)>,
     mut probes: ResMut<MediaProbes>,
     media_settings: Res<MediaSettings>,
     mut target: ResMut<BillboardMenuTarget>,
@@ -178,7 +178,7 @@ pub(crate) fn refresh_billboard_menu(
     pause_menu: Res<PauseMenuState>,
     probes: Res<MediaProbes>,
     media_settings: Res<MediaSettings>,
-    billboards: Query<&GenerationBillboard>,
+    billboards: Query<&MediaBillboard>,
     target: Res<BillboardMenuTarget>,
     mut menu: ResMut<ContextMenu<BillboardMenuCommand>>,
 ) {

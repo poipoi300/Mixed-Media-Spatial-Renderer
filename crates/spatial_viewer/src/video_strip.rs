@@ -18,10 +18,10 @@ use bevy::math::primitives::Rectangle;
 use bevy::prelude::*;
 use bevy::render::{mesh::PrimitiveTopology, render_asset::RenderAssetUsages};
 use bevy::window::PrimaryWindow;
-use generation_viewer_ui::{PauseMenuState, RenderResolutionSettings, UiInputCapture};
+use spatial_viewer_ui::{PauseMenuState, RenderResolutionSettings, UiInputCapture};
 
 use crate::axis_gizmo::{cursor_over_axis_gizmo, render_label_text, LabelTextLine};
-use crate::image_loading::GenerationBillboard;
+use crate::image_loading::MediaBillboard;
 use crate::manual_spacing::{
     cursor_world_ray, nearest_billboard_hit, SelectionState, TranslateGizmo,
 };
@@ -245,7 +245,7 @@ type StripRootQuery<'w, 's> = Query<
         &'static mut Visibility,
         &'static mut StripLayout,
     ),
-    (Without<FlyCamera>, Without<GenerationBillboard>),
+    (Without<FlyCamera>, Without<MediaBillboard>),
 >;
 
 type StripPartQuery<'w, 's> = Query<
@@ -295,7 +295,7 @@ pub(crate) fn handle_video_strip_input(
     scene: Res<ExplorerScene>,
     gizmo: Res<TranslateGizmo>,
     parts: VideoStripHitQuery,
-    billboards: Query<(&GenerationBillboard, &GlobalTransform, &Visibility)>,
+    billboards: Query<(&MediaBillboard, &GlobalTransform, &Visibility)>,
     mut playback: VideoPlaybackControl,
 ) {
     if pause_menu.paused {
@@ -414,7 +414,7 @@ pub(crate) fn sync_video_strips(
     mut label_assets: StripLabelAssets,
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: StripCameraQuery,
-    billboards: Query<(&GenerationBillboard, &Transform, &Visibility), Without<VideoStripRoot>>,
+    billboards: Query<(&MediaBillboard, &Transform, &Visibility), Without<VideoStripRoot>>,
     mut roots: StripRootQuery,
 ) {
     let (Ok(window), Ok((camera, camera_transform, projection))) =
@@ -489,7 +489,7 @@ pub(crate) fn sync_video_strips(
 pub(crate) fn layout_video_strip_parts(
     controls_state: Res<VideoControlsState>,
     media_settings: Res<MediaSettings>,
-    billboards: Query<&GenerationBillboard>,
+    billboards: Query<&MediaBillboard>,
     roots: Query<(&VideoStripRoot, &StripLayout)>,
     mut parts: StripPartQuery,
 ) {
@@ -524,7 +524,7 @@ pub(crate) fn update_video_strip_labels(
     media_settings: Res<MediaSettings>,
     video_font: Res<VideoControlsFont>,
     mut label_assets: StripLabelAssets,
-    billboards: Query<&GenerationBillboard>,
+    billboards: Query<&MediaBillboard>,
     mut labels: Query<(
         &VideoControlsOwner,
         &mut VideoStripLabel,
@@ -573,7 +573,7 @@ pub(crate) fn update_video_strip_labels(
 fn strip_statuses(
     controls_state: &VideoControlsState,
     media_settings: &MediaSettings,
-    billboards: &Query<&GenerationBillboard>,
+    billboards: &Query<&MediaBillboard>,
     image_ids: impl IntoIterator<Item = usize>,
 ) -> HashMap<usize, VideoStripStatus> {
     let image_ids: HashSet<usize> = image_ids.into_iter().collect();

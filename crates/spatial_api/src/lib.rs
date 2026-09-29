@@ -23,7 +23,7 @@ use std::time::Duration;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
-pub struct GenerationApiClient {
+pub struct SpatialApiClient {
     base_url: String,
     client: Client,
 }
@@ -142,7 +142,7 @@ pub enum CatalogStreamEvent {
     Heartbeat,
 }
 
-impl GenerationApiClient {
+impl SpatialApiClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn catalog_stream_delivers_first_event_before_response_finishes() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = GenerationApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let client = SpatialApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
         let (first_received, wait_for_first) = mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn catalog_stream_passes_heartbeats_through_until_completion() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = GenerationApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let client = SpatialApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let mut buffer = [0; 8192];
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn catalog_stream_rejects_missing_completion() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = GenerationApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let client = SpatialApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let mut buffer = [0; 8192];
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn requests_carry_every_control_value_and_the_activated_control() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = GenerationApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let client = SpatialApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
         let (body_sender, body_receiver) = mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();

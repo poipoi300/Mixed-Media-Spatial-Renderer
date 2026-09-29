@@ -7,8 +7,8 @@ use std::{
 
 use ab_glyph::FontArc;
 use bevy::{math::primitives::Rectangle, prelude::*};
-use generation_geometry::normalized_or;
-use generation_viewer_ui::{
+use spatial_geometry::normalized_or;
+use spatial_viewer_ui::{
     BillboardControls, BillboardFacingAxis, BillboardFacingSettings, BillboardStats,
     NavigationSettings, PauseMenuState,
 };
@@ -83,7 +83,7 @@ const BILLBOARD_QUALITY_LOOKAHEAD_MAX_STEPS: f32 = 12.0;
 const BILLBOARD_PENDING_CELLS_PER_FRAME: usize = 192;
 
 #[derive(Component)]
-pub struct GenerationBillboard {
+pub struct MediaBillboard {
     pub image_id: usize,
     pub path: Arc<str>,
     pub is_video: bool,
@@ -94,7 +94,7 @@ pub struct GenerationBillboard {
     pub surface_assets: BillboardSurfaceAssets,
 }
 
-impl GenerationBillboard {
+impl MediaBillboard {
     /// Half extents, in billboard-local units, of the picture inside the
     /// square billboard of `world_size`. Sources are letterboxed into the
     /// square with transparent padding, so a landscape picture leaves empty
@@ -102,11 +102,11 @@ impl GenerationBillboard {
     ///
     /// TODO: verify, and fix if true, that a video with rotation metadata
     /// (phone footage stored landscape, tagged to play portrait) gets a
-    /// sideways rect here: the catalog's `video_metadata`
-    /// (`generation_explorer/catalog.py`) is suspected to report the stored
-    /// size, while ffmpeg auto-rotates the decoded frames. Picking and strip
-    /// placement would then not match the picture. Fix by having the catalog
-    /// report the displayed size, or by deriving the rect from the decode.
+    /// sideways rect here: the catalog server's `video_metadata` is suspected
+    /// to report the stored size, while ffmpeg auto-rotates the decoded
+    /// frames. Picking and strip placement would then not match the picture.
+    /// Fix by having the catalog report the displayed size, or by deriving
+    /// the rect from the decode.
     pub fn content_half_extents(&self, world_size: f32) -> Vec2 {
         let half_size = world_size * 0.5;
         match self.source_size {
@@ -796,7 +796,7 @@ pub fn receive_image_loads(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut cloud: ResMut<PointCloud>,
-    mut billboard_query: Query<&mut GenerationBillboard>,
+    mut billboard_query: Query<&mut MediaBillboard>,
 ) {
     state.last_upload_count = 0;
     state.last_upload_bytes = 0;
@@ -982,7 +982,7 @@ pub fn receive_image_loads(
                     .spawn((
                         Transform::from_translation(point.position),
                         Visibility::Inherited,
-                        Name::new(format!("generation image {}", point.image_id)),
+                        Name::new(format!("media billboard {}", point.image_id)),
                     ))
                     .id();
                 let surface_assets = attach_billboard_surface(
@@ -993,7 +993,7 @@ pub fn receive_image_loads(
                     billboard_world_size.0,
                     completed.uploaded_surface,
                 );
-                commands.entity(entity).insert(GenerationBillboard {
+                commands.entity(entity).insert(MediaBillboard {
                     image_id: point.image_id,
                     path: point.path.clone(),
                     is_video: point.is_video,
@@ -1115,8 +1115,8 @@ pub fn face_billboards_to_camera(
     navigation: Res<NavigationSettings>,
     pause_menu: Res<PauseMenuState>,
     mut stats: ResMut<BillboardStats>,
-    camera_query: Query<&Transform, (With<FlyCamera>, Without<GenerationBillboard>)>,
-    mut billboard_query: Query<&mut Transform, With<GenerationBillboard>>,
+    camera_query: Query<&Transform, (With<FlyCamera>, Without<MediaBillboard>)>,
+    mut billboard_query: Query<&mut Transform, With<MediaBillboard>>,
     mut last_snapshot: Local<Option<BillboardFacingSnapshot>>,
 ) {
     if pause_menu.paused {
@@ -2715,7 +2715,7 @@ mod tests {
 
     #[test]
     fn content_half_extents_follow_the_letterboxed_source_aspect() {
-        let billboard = |source_size| GenerationBillboard {
+        let billboard = |source_size| MediaBillboard {
             image_id: 0,
             path: "video.mp4".into(),
             is_video: true,

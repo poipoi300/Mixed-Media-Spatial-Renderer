@@ -15,8 +15,8 @@ use bevy::{
     sprite::Anchor,
     window::PrimaryWindow,
 };
-use generation_viewer_ui::{AxisGizmoFace, AxisGizmoState, PauseMenuState, UiInputCapture};
 use image::{Rgba, RgbaImage};
+use spatial_viewer_ui::{AxisGizmoFace, AxisGizmoState, PauseMenuState, UiInputCapture};
 
 use super::{BillboardLabelFont, FlyCamera, PRESENTATION_RENDER_LAYER};
 
@@ -1106,14 +1106,14 @@ pub(crate) fn load_label_font() -> Option<FontArc> {
         }
     }
     eprintln!(
-        "No gizmo font found. Set GENERATION_VIEWER_GIZMO_FONT to a TrueType/OpenType font path."
+        "No gizmo font found. Set SPATIAL_VIEWER_GIZMO_FONT to a TrueType/OpenType font path."
     );
     None
 }
 
 fn gizmo_font_candidates() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(path) = env::var_os("GENERATION_VIEWER_GIZMO_FONT") {
+    if let Some(path) = env::var_os("SPATIAL_VIEWER_GIZMO_FONT") {
         paths.push(PathBuf::from(path));
     }
     paths.extend([

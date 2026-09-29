@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 # The control-panel schema is shared with the viewer, so the two cannot drift.
-generation_api = { path = "../generation_api" }
+spatial_api = { path = "../spatial_api" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Blocking, dependency-light HTTP. This crate ships as the viewer's reference

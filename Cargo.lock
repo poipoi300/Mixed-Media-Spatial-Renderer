@@ -2242,52 +2242,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "generation_api"
-version = "0.1.0"
-dependencies = [
- "reqwest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "generation_geometry"
-version = "0.1.0"
-dependencies = [
- "bevy_math",
- "generation_api",
-]
-
-[[package]]
-name = "generation_viewer"
-version = "0.1.0"
-dependencies = [
- "ab_glyph",
- "anyhow",
- "arboard",
- "bcdec_rs",
- "bevy",
- "crossbeam-channel",
- "dirs",
- "generation_api",
- "generation_geometry",
- "generation_viewer_ui",
- "image 0.24.9",
- "intel_tex_2",
- "rodio",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "generation_viewer_ui"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "generation_api",
-]
-
-[[package]]
 name = "gethostname"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4493,9 +4447,9 @@ dependencies = [
 name = "shape_api"
 version = "0.1.0"
 dependencies = [
- "generation_api",
  "serde",
  "serde_json",
+ "spatial_api",
  "tiny_http",
 ]
 
@@ -4600,6 +4554,52 @@ checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spatial_api"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "spatial_geometry"
+version = "0.1.0"
+dependencies = [
+ "bevy_math",
+ "spatial_api",
+]
+
+[[package]]
+name = "spatial_viewer"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "anyhow",
+ "arboard",
+ "bcdec_rs",
+ "bevy",
+ "crossbeam-channel",
+ "dirs",
+ "image 0.24.9",
+ "intel_tex_2",
+ "rodio",
+ "serde",
+ "serde_json",
+ "spatial_api",
+ "spatial_geometry",
+ "spatial_viewer_ui",
+]
+
+[[package]]
+name = "spatial_viewer_ui"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "spatial_api",
 ]
 
 [[package]]

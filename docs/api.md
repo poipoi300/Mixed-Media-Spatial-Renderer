@@ -2,7 +2,7 @@
 
 The viewer holds no knowledge of what its data means: it renders whatever an
 HTTP server describes. This is that contract. `crates/shape_api` is a complete,
-small reference implementation, and `crates/generation_api` holds the shared
+small reference implementation, and `crates/spatial_api` holds the shared
 wire types.
 
 Three endpoints drive the viewer. Any server that implements them can drive it;
@@ -11,7 +11,7 @@ shapes:
 
 ```powershell
 cargo run --release -p shape_api -- --port 8766
-cargo run --release -p generation_viewer -- --api http://127.0.0.1:8766
+cargo run --release -p spatial_viewer -- --api http://127.0.0.1:8766
 ```
 
 | Endpoint | Purpose |

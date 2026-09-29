@@ -15,11 +15,9 @@ use bevy::render::{
 };
 use bevy::sprite::AlphaMode2d;
 use bevy::window::{CursorGrabMode, PrimaryWindow, WindowResizeConstraints};
-use generation_api::{GenerationApiClient, ProjectionPage, ProjectionRequest};
-use generation_geometry::{
-    estimate_smallest_axis_gap, median_position, projection_bounds, Bounds3,
-};
-use generation_viewer_ui::{
+use spatial_api::{ProjectionPage, ProjectionRequest, SpatialApiClient};
+use spatial_geometry::{estimate_smallest_axis_gap, median_position, projection_bounds, Bounds3};
+use spatial_viewer_ui::{
     collect_performance_metrics, handle_audio_buttons, handle_billboard_buttons,
     handle_control_buttons, handle_control_dropdown_scroll, handle_control_keyboard,
     handle_debug_buttons, handle_navigation_buttons, handle_pause_menu_buttons,
@@ -88,8 +86,8 @@ use image_loading::{
     billboard_rotation, billboard_world_size, create_billboard_mesh, face_billboards_to_camera,
     publish_image_loading_stats, receive_image_loads, schedule_image_loads,
     spawn_visible_coordinate_labels, update_billboard_coordinate_label_visibility,
-    BillboardAxisLabels, BillboardLabelFont, BillboardPoint, BillboardWorldSize,
-    GenerationBillboard, ImageLoadingState, BILLBOARD_GPU_UPLOAD_BYTES_PER_FRAME,
+    BillboardAxisLabels, BillboardLabelFont, BillboardPoint, BillboardWorldSize, ImageLoadingState,
+    MediaBillboard, BILLBOARD_GPU_UPLOAD_BYTES_PER_FRAME,
 };
 use manual_spacing::{
     handle_selection_and_drag, sync_selection_highlights, sync_translate_gizmo, ImagePointIndex,
@@ -113,10 +111,10 @@ use video_strip::{
 
 #[derive(Resource)]
 struct ExplorerScene {
-    projection: generation_api::ProjectionPage,
+    projection: spatial_api::ProjectionPage,
     bounds: Bounds3,
     image_points: Vec<BillboardPoint>,
-    client: GenerationApiClient,
+    client: SpatialApiClient,
     projection_limit: usize,
     coordinate_spacing: f32,
     duplicate_spacing: f32,
@@ -250,7 +248,7 @@ struct RenderedSceneCanvas;
 #[derive(Component)]
 struct PresentationCamera;
 
-type BillboardEntitiesQuery<'w, 's> = Query<'w, 's, (Entity, &'static GenerationBillboard)>;
+type BillboardEntitiesQuery<'w, 's> = Query<'w, 's, (Entity, &'static MediaBillboard)>;
 type FlyCameraTransformQuery<'w, 's> =
     Query<'w, 's, (&'static mut Transform, &'static mut FlyCamera)>;
 #[derive(SystemParam)]
@@ -266,7 +264,7 @@ type FlyCameraProjectionQuery<'w, 's> = Query<'w, 's, &'static mut Projection, W
 
 fn main() -> Result<()> {
     let args = ViewerArgs::parse()?;
-    let client = GenerationApiClient::new(&args.api);
+    let client = SpatialApiClient::new(&args.api);
     let health = client
         .health()
         .with_context(|| format!("Failed to reach viewer API at {}", args.api))?;
@@ -296,7 +294,7 @@ fn main() -> Result<()> {
     let initial_view_distance = initial_camera_distance(args.spacing, image_world_size);
     let axis_labels = projection.axis_labels.clone().map(axis_label);
     let last_catalog_roots =
-        if std::env::var_os("GENERATION_VIEWER_PERF_CONFIG").is_some() {
+        if std::env::var_os("SPATIAL_VIEWER_PERF_CONFIG").is_some() {
             serde_json::from_str(&std::env::var(performance::PERF_ROOTS_ENV).with_context(
                 || format!("Performance run requires {}", performance::PERF_ROOTS_ENV),
             )?)
@@ -767,8 +765,8 @@ fn setup_scene(
     commands.insert_resource(BillboardFacingSettings::default());
     commands.insert_resource(BillboardControls::new(
         scene.texture_budget_mib.clamp(
-            generation_viewer_ui::MIN_TEXTURE_BUDGET_MIB,
-            generation_viewer_ui::MAX_TEXTURE_BUDGET_MIB,
+            spatial_viewer_ui::MIN_TEXTURE_BUDGET_MIB,
+            spatial_viewer_ui::MAX_TEXTURE_BUDGET_MIB,
         ),
         scene.max_texture_side,
     ));
@@ -933,7 +931,7 @@ fn spawn_debug_probe_billboard(
             rotation,
             ..default()
         },
-        GenerationBillboard {
+        MediaBillboard {
             image_id: usize::MAX,
             path: "debug-probe".into(),
             is_video: false,
@@ -1634,8 +1632,8 @@ fn apply_axis_gizmo_requests(
 fn apply_billboard_visibility(
     controls: Res<ControlPanelState>,
     scene: Res<ExplorerScene>,
-    camera_query: Query<&Transform, (With<FlyCamera>, Without<GenerationBillboard>)>,
-    mut billboards: Query<(Ref<GenerationBillboard>, &Transform, &mut Visibility)>,
+    camera_query: Query<&Transform, (With<FlyCamera>, Without<MediaBillboard>)>,
+    mut billboards: Query<(Ref<MediaBillboard>, &Transform, &mut Visibility)>,
     mut last_applied: Local<Option<(Vec3, Quat, f32, usize)>>,
 ) {
     let radius = controls.slice_depth_cells() * scene.coordinate_spacing;
@@ -1801,7 +1799,7 @@ fn billboard_axis_labels(axis_labels: &[Option<String>; 3]) -> BillboardAxisLabe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use generation_viewer_ui::AxisGizmoFace;
+    use spatial_viewer_ui::AxisGizmoFace;
 
     #[test]
     fn initial_camera_distance_uses_local_spacing() {
@@ -1844,7 +1842,7 @@ mod tests {
         // bounding box far past where most points actually live; the median
         // should stay inside the dense cluster instead of drifting toward an
         // empty region like `Bounds3::center` (the min/max midpoint) does.
-        let make_point = |image_id: usize, position: [f32; 3]| generation_api::ProjectionPoint {
+        let make_point = |image_id: usize, position: [f32; 3]| spatial_api::ProjectionPoint {
             image_id,
             path: String::new(),
             position,
@@ -2062,10 +2060,10 @@ mod tests {
 
         let mut menu = app
             .world_mut()
-            .resource_mut::<generation_viewer_ui::ContextMenu<BillboardMenuCommand>>();
+            .resource_mut::<spatial_viewer_ui::ContextMenu<BillboardMenuCommand>>();
         menu.open(
             Vec2::ZERO,
-            generation_viewer_ui::ContextMenuModel {
+            spatial_viewer_ui::ContextMenuModel {
                 title: PATH.to_owned(),
                 sections: Vec::new(),
             },
@@ -2096,7 +2094,7 @@ mod tests {
 
     pub(crate) fn test_scene() -> ExplorerScene {
         ExplorerScene {
-            projection: generation_api::ProjectionPage {
+            projection: spatial_api::ProjectionPage {
                 axis_labels: [None, None, None],
                 coordinate_spacing: 6.0,
                 duplicate_spacing: 0.8,
@@ -2113,7 +2111,7 @@ mod tests {
                 max_extent: 1.0,
             },
             image_points: Vec::new(),
-            client: GenerationApiClient::new("http://127.0.0.1:8765"),
+            client: SpatialApiClient::new("http://127.0.0.1:8765"),
             projection_limit: 0,
             coordinate_spacing: 6.0,
             duplicate_spacing: 0.8,

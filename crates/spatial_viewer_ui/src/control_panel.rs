@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashSet};
 use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, RelativeCursorPosition};
 
-use generation_api::{ControlPanel, ControlValue, ControlValues, ControlWidget};
+use spatial_api::{ControlPanel, ControlValue, ControlValues, ControlWidget};
 
 use crate::{
     button_color, display_if, expanded_panel, header_button_color, pill_node, set_button_color,
@@ -527,7 +527,7 @@ impl ControlPanelState {
     }
 
     /// Options of the open select, narrowed by the live filter.
-    fn filtered_options(&self) -> Vec<&generation_api::ControlOption> {
+    fn filtered_options(&self) -> Vec<&spatial_api::ControlOption> {
         let Some(ControlWidget::Select { options, .. }) =
             self.open_dropdown_id().and_then(|id| self.panel.find(id))
         else {
@@ -546,10 +546,7 @@ impl ControlPanelState {
             .collect()
     }
 
-    pub(crate) fn dropdown_option(
-        &self,
-        row_index: usize,
-    ) -> Option<&generation_api::ControlOption> {
+    pub(crate) fn dropdown_option(&self, row_index: usize) -> Option<&spatial_api::ControlOption> {
         if row_index >= CONTROL_DROPDOWN_VISIBLE_OPTIONS {
             return None;
         }
@@ -1653,7 +1650,7 @@ pub fn control_values_from_assignments<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use generation_api::{ControlOption, StatLine};
+    use spatial_api::{ControlOption, StatLine};
 
     fn sample_panel(revision: u64) -> ControlPanel {
         ControlPanel {

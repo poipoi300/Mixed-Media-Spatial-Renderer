@@ -20,8 +20,8 @@ use std::{
 };
 
 use bevy::prelude::*;
-use generation_viewer_ui::{AudioSettings, PlaybackSettings};
 use serde::{Deserialize, Serialize};
+use spatial_viewer_ui::{AudioSettings, PlaybackSettings};
 
 use crate::catalog_session::user_state_directory;
 use crate::media_decode::SubtitleBurn;

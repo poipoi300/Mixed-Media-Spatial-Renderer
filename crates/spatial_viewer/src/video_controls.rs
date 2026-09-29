@@ -40,7 +40,7 @@ use std::sync::Arc;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::window::{CursorMoved, PrimaryWindow};
-use generation_viewer_ui::{
+use spatial_viewer_ui::{
     AudioSettings, ControlPanelState, PauseMenuState, PlaybackSettings, RenderResolutionSettings,
     UiInputCapture,
 };
@@ -49,7 +49,7 @@ use crate::audio_stream::{
     AudioClock, AudioClockSample, AudioPlaybackState, SoundChoice, SoundTrack,
 };
 use crate::axis_gizmo::cursor_over_axis_gizmo;
-use crate::image_loading::{GenerationBillboard, BILLBOARD_VIDEO_TEXTURE_SIDE};
+use crate::image_loading::{MediaBillboard, BILLBOARD_VIDEO_TEXTURE_SIDE};
 use crate::manual_spacing::{cursor_world_ray, nearest_billboard_hit, SelectionState};
 use crate::media_probe::{MediaProbe, MediaProbes};
 use crate::media_settings::{MediaSettings, VideoFileSettings};
@@ -634,7 +634,7 @@ impl VideoPlaybackControl<'_> {
 
     /// Starts the video (see [`start_video`]), then hands back the state so
     /// the caller can act on its clock.
-    pub(crate) fn started(&mut self, billboard: &GenerationBillboard) -> &mut VideoControlsState {
+    pub(crate) fn started(&mut self, billboard: &MediaBillboard) -> &mut VideoControlsState {
         start_video(
             VideoStart {
                 controls: &mut self.controls,
@@ -664,11 +664,7 @@ pub(crate) struct VideoStart<'a> {
 /// Ensures the video has a clock — paused where it was left when positions
 /// are remembered, else at 0:00 — a probe of its file, and running decode
 /// pipelines. Every entry point that starts a video goes through here.
-pub(crate) fn start_video(
-    start: VideoStart,
-    billboard: &GenerationBillboard,
-    max_texture_side: u32,
-) {
+pub(crate) fn start_video(start: VideoStart, billboard: &MediaBillboard, max_texture_side: u32) {
     let image_id = billboard.image_id;
     if start.controls.clock(image_id).is_some() {
         return;
@@ -704,7 +700,7 @@ pub(crate) fn start_video(
 
 /// Playback length of a video billboard; an unknown duration plays as one
 /// second rather than breaking the slider.
-pub(crate) fn video_duration_seconds(billboard: &GenerationBillboard) -> f32 {
+pub(crate) fn video_duration_seconds(billboard: &MediaBillboard) -> f32 {
     billboard
         .duration_seconds
         .unwrap_or(1.0)
@@ -716,7 +712,7 @@ pub(crate) fn video_duration_seconds(billboard: &GenerationBillboard) -> f32 {
 pub(crate) fn video_strip_wanted(
     controls: &VideoControlsState,
     selection: &SelectionState,
-    billboard: &GenerationBillboard,
+    billboard: &MediaBillboard,
     visibility: &Visibility,
 ) -> bool {
     billboard.is_video
@@ -735,7 +731,7 @@ pub(crate) fn clear_stale_video_controls(
     mut audio_playback: ResMut<AudioPlaybackState>,
     playback_settings: Res<PlaybackSettings>,
     mut media_settings: ResMut<MediaSettings>,
-    billboard_query: Query<&GenerationBillboard>,
+    billboard_query: Query<&MediaBillboard>,
 ) {
     if controls_state.clocks.is_empty() && controls_state.reveal_seconds.is_empty() {
         return;
@@ -794,7 +790,7 @@ pub(crate) fn reveal_hovered_videos(
     mut controls_state: ResMut<VideoControlsState>,
     window_query: Query<&Window, With<PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<FlyCamera>>,
-    billboards: Query<(&GenerationBillboard, &GlobalTransform, &Visibility)>,
+    billboards: Query<(&MediaBillboard, &GlobalTransform, &Visibility)>,
     strip_parts: VideoStripHitQuery,
 ) {
     controls_state.tick_reveals(time.delta_secs());
@@ -849,7 +845,7 @@ pub(crate) fn handle_video_keyboard(
     pause_menu: Res<PauseMenuState>,
     control_panel: Res<ControlPanelState>,
     selection: Res<SelectionState>,
-    billboards: Query<&GenerationBillboard>,
+    billboards: Query<&MediaBillboard>,
     mut playback: VideoPlaybackControl,
 ) {
     if pause_menu.paused || control_panel.input_focused() {
@@ -861,7 +857,7 @@ pub(crate) fn handle_video_keyboard(
     if !toggle && seek_steps == 0 {
         return;
     }
-    let selected_videos: Vec<&GenerationBillboard> = billboards
+    let selected_videos: Vec<&MediaBillboard> = billboards
         .iter()
         .filter(|billboard| billboard.is_video && selection.is_selected(billboard.image_id))
         .collect();
@@ -1008,7 +1004,7 @@ pub(crate) fn apply_video_playback_frame(
     probes: Res<MediaProbes>,
     media_settings: Res<MediaSettings>,
     mut video_playback: ResMut<VideoPlaybackState>,
-    mut billboard_query: Query<&mut GenerationBillboard>,
+    mut billboard_query: Query<&mut MediaBillboard>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {

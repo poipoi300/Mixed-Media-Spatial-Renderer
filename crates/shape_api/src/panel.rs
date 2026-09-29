@@ -7,10 +7,10 @@
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use generation_api::{
+use serde::Serialize;
+use spatial_api::{
     ControlOption, ControlPanel, ControlValue, ControlValues, ControlWidget, StatLine,
 };
-use serde::Serialize;
 
 use crate::media::{collect_media, MediaFile};
 use crate::shapes::{seed_from_text, Fill, Layout, Rng, Shape};

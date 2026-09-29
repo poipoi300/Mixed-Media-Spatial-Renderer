@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/generation_api",
-    "crates/generation_geometry",
-    "crates/generation_viewer_ui",
-    "crates/generation_viewer",
+    "crates/spatial_api",
+    "crates/spatial_geometry",
+    "crates/spatial_viewer_ui",
+    "crates/spatial_viewer",
     "crates/shape_api",
 ]
 resolver = "2"

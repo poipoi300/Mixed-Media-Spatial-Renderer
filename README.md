@@ -41,7 +41,7 @@ ring or spiral. Start it, then point the viewer at it:
 
 ```sh
 cargo run --release -p shape_api -- --port 8766
-cargo run --release -p generation_viewer -- --api http://127.0.0.1:8766
+cargo run --release -p spatial_viewer -- --api http://127.0.0.1:8766
 ```
 
 On first launch the scene is empty. Press `Escape`, open **Settings >
@@ -95,7 +95,7 @@ Click a face to snap the camera to that axis.
 --benchmark <SECONDS>        Benchmark the catalog once loaded, write a report, exit
 ```
 
-`cargo run --release -p generation_viewer -- --help` prints the full
+`cargo run --release -p spatial_viewer -- --help` prints the full
 descriptions.
 
 ## Writing a server
@@ -105,16 +105,16 @@ and `POST /projection`. It keeps no per-client state; every request carries
 all control values. [docs/api.md](docs/api.md) describes the contract, and
 [`crates/shape_api`](crates/shape_api) is a complete implementation in under
 2,000 lines, tests included. The wire types live in
-[`crates/generation_api`](crates/generation_api) and can be reused from Rust.
+[`crates/spatial_api`](crates/spatial_api) and can be reused from Rust.
 
 ## Workspace layout
 
 | Crate | Purpose |
 |---|---|
-| `generation_viewer` | The viewer binary: rendering, decoding, video, input |
-| `generation_viewer_ui` | Panels, menus and the server-described control renderer |
-| `generation_api` | HTTP client and wire schema shared by viewer and servers |
-| `generation_geometry` | Engine-free geometry helpers |
+| `spatial_viewer` | The viewer binary: rendering, decoding, video, input |
+| `spatial_viewer_ui` | Panels, menus and the server-described control renderer |
+| `spatial_api` | HTTP client and wire schema shared by viewer and servers |
+| `spatial_geometry` | Engine-free geometry helpers |
 | `shape_api` | Reference server |
 
 `tests/performance` holds a harness that runs several viewer processes

@@ -20,11 +20,11 @@ use std::sync::{Arc, Mutex};
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
-use generation_api::{CatalogStreamEvent, ControlPanel, ProjectionPage};
-use generation_geometry::{
+use spatial_api::{CatalogStreamEvent, ControlPanel, ProjectionPage};
+use spatial_geometry::{
     api_position_to_viewer, estimate_smallest_axis_gap, projection_bounds, Bounds3,
 };
-use generation_viewer_ui::{
+use spatial_viewer_ui::{
     BillboardControls, BillboardStats, ControlPanelState, NavigationSettings, NavigationTargets,
     PauseMenuState, PendingSubmit, StartMenuState,
 };
@@ -199,9 +199,7 @@ pub(crate) struct SceneReloadAssets<'w> {
     images: ResMut<'w, Assets<Image>>,
 }
 
-pub(crate) fn point_cloud_points(
-    projection: &generation_api::ProjectionPage,
-) -> Vec<PointCloudPoint> {
+pub(crate) fn point_cloud_points(projection: &spatial_api::ProjectionPage) -> Vec<PointCloudPoint> {
     projection
         .points
         .iter()
@@ -217,7 +215,7 @@ pub(crate) fn point_cloud_points(
 }
 
 pub(crate) fn projection_billboard_points(
-    projection: &generation_api::ProjectionPage,
+    projection: &spatial_api::ProjectionPage,
 ) -> Vec<BillboardPoint> {
     projection
         .points
@@ -473,7 +471,7 @@ pub(crate) fn poll_catalog_load_task(
             ));
             if complete {
                 if let Some(roots) = roots {
-                    if std::env::var_os("GENERATION_VIEWER_PERF_CONFIG").is_none() {
+                    if std::env::var_os("SPATIAL_VIEWER_PERF_CONFIG").is_none() {
                         if let Err(error) = save_last_catalog_roots(&roots) {
                             eprintln!("Failed to remember catalog roots: {error}");
                         }
@@ -741,12 +739,12 @@ Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.ShowNewFolderButton = $false
 try {
-    $dialog.Description = 'Select generation media folder'
+    $dialog.Description = 'Select media folder'
     $dialog.UseDescriptionForTitle = $true
 } catch {}
-if ($env:GENERATION_VIEWER_PICKER_START) {
-    try { $dialog.InitialDirectory = $env:GENERATION_VIEWER_PICKER_START }
-    catch { $dialog.SelectedPath = $env:GENERATION_VIEWER_PICKER_START }
+if ($env:SPATIAL_VIEWER_PICKER_START) {
+    try { $dialog.InitialDirectory = $env:SPATIAL_VIEWER_PICKER_START }
+    catch { $dialog.SelectedPath = $env:SPATIAL_VIEWER_PICKER_START }
 }
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     [Console]::Out.Write($dialog.SelectedPath)
@@ -758,7 +756,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             command.args(extra_args);
             command.args(["-Command", script]);
             if let Some(initial) = initial_directory {
-                command.env("GENERATION_VIEWER_PICKER_START", initial);
+                command.env("SPATIAL_VIEWER_PICKER_START", initial);
             }
             let Ok(output) = command.output() else {
                 continue;
@@ -823,7 +821,7 @@ mod tests {
         let mut projection = test_scene().projection;
         projection.points = points
             .iter()
-            .map(|&(image_id, position)| generation_api::ProjectionPoint {
+            .map(|&(image_id, position)| spatial_api::ProjectionPoint {
                 image_id,
                 position,
                 path: format!("{image_id}.png"),

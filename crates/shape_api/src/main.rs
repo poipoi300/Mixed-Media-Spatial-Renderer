@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! cargo run -p shape_api -- --port 8766
-//! cargo run -p generation_viewer -- --api http://127.0.0.1:8766
+//! cargo run -p spatial_viewer -- --api http://127.0.0.1:8766
 //! ```
 
 mod media;
@@ -23,8 +23,8 @@ mod shapes;
 
 use std::sync::Mutex;
 
-use generation_api::ControlValues;
 use serde::{Deserialize, Serialize};
+use spatial_api::ControlValues;
 use tiny_http::{Header, Request, Response, Server};
 
 use panel::{build_snapshot, CatalogSnapshot, Controls, ServerState, RANDOMIZE_CONTROL};
@@ -92,7 +92,7 @@ fn main() {
     };
     println!("Shape API listening on http://{address}");
     println!("Point the viewer at it:");
-    println!("    cargo run --release -p generation_viewer -- --api http://{address}");
+    println!("    cargo run --release -p spatial_viewer -- --api http://{address}");
 
     let state = Mutex::new(ServerState::default());
     for request in server.incoming_requests() {
@@ -123,7 +123,7 @@ fn parse_port() -> u16 {
             "--help" | "-h" => {
                 println!(
                     "\
-Shape API — a minimal server for the generation viewer
+Shape API — a minimal server for the spatial viewer
 
 USAGE:
     shape_api [--port <PORT>]
@@ -298,8 +298,8 @@ mod tests {
         assert!(parsed["projection"]["axis_labels"].is_array());
 
         // The viewer must be able to deserialize exactly this.
-        let event: generation_api::CatalogStreamEvent = serde_json::from_str(&line).unwrap();
-        let generation_api::CatalogStreamEvent::Snapshot {
+        let event: spatial_api::CatalogStreamEvent = serde_json::from_str(&line).unwrap();
+        let spatial_api::CatalogStreamEvent::Snapshot {
             panel, complete, ..
         } = event
         else {

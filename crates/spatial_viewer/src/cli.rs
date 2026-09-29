@@ -6,8 +6,8 @@
 //! reachable.
 
 use anyhow::{bail, Context, Result};
-use generation_api::ControlValues;
-use generation_viewer_ui::control_values_from_assignments;
+use spatial_api::ControlValues;
+use spatial_viewer_ui::control_values_from_assignments;
 
 use crate::media_decode::DEFAULT_MAX_VIDEO_FPS;
 
@@ -50,7 +50,7 @@ impl ViewerArgs {
             limit: 10_000,
             spacing: 6.0,
             duplicates: 0.8,
-            texture_budget_mib: generation_viewer_ui::DEFAULT_TEXTURE_BUDGET_MIB,
+            texture_budget_mib: spatial_viewer_ui::DEFAULT_TEXTURE_BUDGET_MIB,
             image_concurrency: 12,
             // Source resolution. Sizing every image down cost a visible
             // quality drop on 78% of on-screen billboards while saving only
@@ -118,7 +118,7 @@ fn print_help() {
 Mixed Media Spatial Renderer
 
 USAGE:
-    generation_viewer [OPTIONS]
+    spatial_viewer [OPTIONS]
 
 OPTIONS:
     --api <URL>           Viewer API base URL [default: http://127.0.0.1:8765]

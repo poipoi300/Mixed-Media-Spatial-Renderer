@@ -139,7 +139,7 @@ same coordinate are packed into an extent-aware 3D grid.
 The viewer enforces a `960 x 540` minimum window size to keep the renderer,
 gizmo viewport, and UI layout inside valid bounds during resize.
 
-Set `GENERATION_VIEWER_GIZMO_FONT` to a TrueType/OpenType font path if the
+Set `SPATIAL_VIEWER_GIZMO_FONT` to a TrueType/OpenType font path if the
 gizmo cannot find a system font for its 3D axis labels.
 
 Movement speed is a fixed function of the base speed, an optional `Shift`

@@ -50,7 +50,7 @@ use bevy::prelude::*;
 use bevy::render::camera::{ClearColorConfig, RenderTarget};
 use bevy::render::view::RenderLayers;
 use bevy::window::PrimaryWindow;
-use generation_viewer_ui::{
+use spatial_viewer_ui::{
     BillboardControls, BillboardFacingAxis, BillboardFacingSettings, NavigationTargets,
     PauseMenuState, RenderResolutionSettings, UiInputCapture,
 };
@@ -58,7 +58,7 @@ use generation_viewer_ui::{
 use crate::axis_gizmo::cursor_over_axis_gizmo;
 use crate::catalog_load::CatalogLoadTask;
 use crate::image_loading::{
-    billboard_rotation, BillboardPoint, BillboardWorldSize, GenerationBillboard, ImageLoadingState,
+    billboard_rotation, BillboardPoint, BillboardWorldSize, ImageLoadingState, MediaBillboard,
 };
 use crate::point_cloud::PointCloud;
 use crate::video_controls::ray_rect_hit;
@@ -360,13 +360,13 @@ pub struct SelectionDragQueries<'w, 's> {
         'w,
         's,
         (
-            &'static GenerationBillboard,
+            &'static MediaBillboard,
             &'static GlobalTransform,
             &'static Visibility,
         ),
     >,
     billboard_transforms:
-        Query<'w, 's, (&'static GenerationBillboard, &'static mut Transform), Without<FlyCamera>>,
+        Query<'w, 's, (&'static MediaBillboard, &'static mut Transform), Without<FlyCamera>>,
     video_strips: VideoStripHitQuery<'w, 's>,
 }
 
@@ -875,7 +875,7 @@ type GizmoCameraQuery<'w, 's> = Query<
 type GizmoBillboardQuery<'w, 's> = Query<
     'w,
     's,
-    (&'static GenerationBillboard, &'static Transform),
+    (&'static MediaBillboard, &'static Transform),
     (
         Without<TranslateGizmoRoot>,
         Without<TranslateGizmoCamera>,
@@ -1148,7 +1148,7 @@ pub(crate) fn nearest_billboard_hit(
     ray_origin: Vec3,
     ray_direction: Vec3,
     billboard_size: f32,
-    billboards: &Query<(&GenerationBillboard, &GlobalTransform, &Visibility)>,
+    billboards: &Query<(&MediaBillboard, &GlobalTransform, &Visibility)>,
 ) -> Option<BillboardHit> {
     billboards
         .iter()
@@ -1232,7 +1232,7 @@ pub fn sync_selection_highlights(
     mut highlights: ResMut<SelectionHighlights>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    billboards: Query<(Entity, &GenerationBillboard)>,
+    billboards: Query<(Entity, &MediaBillboard)>,
     live_highlights: Query<(), With<SelectionHighlight>>,
 ) {
     if selection.selected.is_empty() && highlights.by_image_id.is_empty() {

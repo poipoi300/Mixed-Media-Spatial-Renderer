@@ -10,8 +10,8 @@ on Vulkan and DX12, and CPU-side pass time elsewhere.
 
 The full record — every stage, the twelve slowest frames with their individual
 breakdowns, and the hardware counters — is written to
-`%LOCALAPPDATA%\generation_viewer\benchmarks\benchmark-<unix-seconds>.json`
-(`$XDG_CONFIG_HOME/generation_viewer/benchmarks/` elsewhere); the panel shows a
+`%LOCALAPPDATA%\spatial_viewer\benchmarks\benchmark-<unix-seconds>.json`
+(`$XDG_CONFIG_HOME/spatial_viewer/benchmarks/` elsewhere); the panel shows a
 summary and the path.
 
 To script a run, use `--benchmark <seconds>`. The viewer loads the catalog,
@@ -20,7 +20,7 @@ that many seconds so loading, quality refresh and eviction all stay active,
 writes the report, prints its path and exits:
 
 ```powershell
-cargo run --release -p generation_viewer -- --limit 3000 --benchmark 20
+cargo run --release -p spatial_viewer -- --limit 3000 --benchmark 20
 ```
 
 `bottleneck` names the first limit the run hit, in the order the pipeline hits

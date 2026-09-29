@@ -1,5 +1,5 @@
 [package]
-name = "generation_viewer_ui"
+name = "spatial_viewer_ui"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,4 +7,4 @@ rust-version.workspace = true
 
 [dependencies]
 bevy = { version = "0.15.3", default-features = true }
-generation_api = { path = "../generation_api" }
+spatial_api = { path = "../spatial_api" }

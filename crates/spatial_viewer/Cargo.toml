@@ -1,5 +1,5 @@
 [package]
-name = "generation_viewer"
+name = "spatial_viewer"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -17,9 +17,9 @@ dirs = "6"
 # video's frame stream can live in an ECS resource.
 crossbeam-channel = "0.5"
 bevy = { version = "0.15.3", default-features = true }
-generation_api = { path = "../generation_api" }
-generation_geometry = { path = "../generation_geometry" }
-generation_viewer_ui = { path = "../generation_viewer_ui" }
+spatial_api = { path = "../spatial_api" }
+spatial_geometry = { path = "../spatial_geometry" }
+spatial_viewer_ui = { path = "../spatial_viewer_ui" }
 image = { version = "0.24.9", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
 # BC7 block compression for billboard textures: the GPU samples it natively
 # at 1 byte/px instead of 4. Ships prebuilt ISPC static libraries, so no

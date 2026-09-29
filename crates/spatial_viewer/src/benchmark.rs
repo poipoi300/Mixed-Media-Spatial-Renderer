@@ -40,11 +40,11 @@ use bevy::{
     prelude::*,
     render::renderer::RenderAdapterInfo,
 };
-use generation_viewer_ui::{
+use serde_json::{json, Value};
+use spatial_viewer_ui::{
     BenchmarkControls, BenchmarkPhase, BenchmarkReport, BenchmarkStageRow, BillboardControls,
     BillboardStats, NavigationSettings,
 };
-use serde_json::{json, Value};
 
 use crate::{
     catalog_session::user_state_directory, performance::FrameStageProbe, ExplorerScene, FlyCamera,
@@ -599,7 +599,7 @@ fn finish_run(
     );
 
     let json = json!({
-        "schema": "generation_viewer.benchmark/1",
+        "schema": "spatial_viewer.benchmark/1",
         "catalog": {
             "projected_points": scene.projection.points.len(),
             "coordinate_spacing": scene.coordinate_spacing,

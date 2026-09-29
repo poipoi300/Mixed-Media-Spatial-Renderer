@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-const SESSION_DIRECTORY_NAME: &str = "generation_viewer";
+const SESSION_DIRECTORY_NAME: &str = "spatial_viewer";
 const LAST_ROOTS_FILE_NAME: &str = "last_catalog_roots.txt";
 
 /// Per-user config file holding the last loaded catalog roots, one per line.

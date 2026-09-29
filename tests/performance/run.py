@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the rendered generation-viewer performance scenarios in parallel."""
+"""Run the rendered spatial-viewer performance scenarios in parallel."""
 
 from __future__ import annotations
 
@@ -384,7 +384,7 @@ def write_video(path: Path) -> None:
 
 
 def executable_name() -> str:
-    return "generation_viewer.exe" if os.name == "nt" else "generation_viewer"
+    return "spatial_viewer.exe" if os.name == "nt" else "spatial_viewer"
 
 
 def resolve_viewer(args: argparse.Namespace) -> Path:
@@ -394,7 +394,7 @@ def resolve_viewer(args: argparse.Namespace) -> Path:
         viewer = VIEWER_ROOT / "target" / "release" / executable_name()
         if not args.no_build:
             subprocess.run(
-                ["cargo", "build", "--release", "-p", "generation_viewer"],
+                ["cargo", "build", "--release", "-p", "spatial_viewer"],
                 cwd=VIEWER_ROOT,
                 check=True,
             )
@@ -446,8 +446,8 @@ def prepare_scenario(
     stderr_file = (scenario_dir / "stderr.log").open("wb")
     environment = os.environ.copy()
     environment.update(extra_environment)
-    environment["GENERATION_VIEWER_PERF_CONFIG"] = str(config_path.resolve())
-    environment["GENERATION_VIEWER_PERF_ROOTS"] = json.dumps(fixture.roots)
+    environment["SPATIAL_VIEWER_PERF_CONFIG"] = str(config_path.resolve())
+    environment["SPATIAL_VIEWER_PERF_ROOTS"] = json.dumps(fixture.roots)
     command = [
         str(viewer),
         "--api",
