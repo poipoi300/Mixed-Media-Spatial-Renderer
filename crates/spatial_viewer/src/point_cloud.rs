@@ -158,6 +158,9 @@ pub struct PointCloud {
     /// hiding mechanisms restore independently; a point renders only when
     /// both flags are clear.
     sliced: Vec<bool>,
+    /// Points held back for a moment while an animation makes room for
+    /// them; restored independently of the other two flags too.
+    withheld: Vec<bool>,
     id_to_index: HashMap<usize, u32>,
     chunk_of_point: Vec<u32>,
     chunks: Vec<PointChunk>,
@@ -184,25 +187,52 @@ impl PointCloud {
     /// Hides or shows a single point (identified by its image id) by marking
     /// its chunk for a mesh rebuild. O(1) apart from the deferred rebuild.
     pub fn set_point_visible(&mut self, image_id: usize, visible: bool) {
+        self.set_point_flag(image_id, |cloud| &mut cloud.hidden, !visible);
+    }
+
+    /// Holds a single point back, or lets it show again, without touching
+    /// whether its billboard hides it.
+    pub fn set_point_withheld(&mut self, image_id: usize, withheld: bool) {
+        self.set_point_flag(image_id, |cloud| &mut cloud.withheld, withheld);
+    }
+
+    /// Sets one of a point's hiding flags, queueing its chunk for a rebake
+    /// only when that changes whether the point renders.
+    fn set_point_flag(
+        &mut self,
+        image_id: usize,
+        flags: fn(&mut Self) -> &mut Vec<bool>,
+        value: bool,
+    ) {
         let Some(&index) = self.id_to_index.get(&image_id) else {
             return;
         };
         let index = index as usize;
-        let hidden = !visible;
-        if self.hidden[index] == hidden {
+        if flags(self)[index] == value {
             return;
         }
-        self.hidden[index] = hidden;
+        let rendered = self.renders(index);
+        flags(self)[index] = value;
+        if self.renders(index) != rendered {
+            self.point_rendering_changed(index);
+        }
+    }
+
+    /// A point renders only while none of its hiding flags is set.
+    fn renders(&self, index: usize) -> bool {
+        !self.hidden[index] && !self.sliced[index] && !self.withheld[index]
+    }
+
+    /// Counts a point that just started or stopped rendering and queues its
+    /// chunk for a rebake.
+    fn point_rendering_changed(&mut self, index: usize) {
         let chunk_index = self.chunk_of_point[index] as usize;
+        let renders = self.renders(index);
         let chunk = &mut self.chunks[chunk_index];
-        // `visible_points` counts points with neither flag set; a sliced
-        // point was already excluded, so its hidden flag doesn't change it.
-        if !self.sliced[index] {
-            if hidden {
-                chunk.visible_points = chunk.visible_points.saturating_sub(1);
-            } else {
-                chunk.visible_points += 1;
-            }
+        if renders {
+            chunk.visible_points += 1;
+        } else {
+            chunk.visible_points = chunk.visible_points.saturating_sub(1);
         }
         if !self.chunk_dirty[chunk_index] {
             self.chunk_dirty[chunk_index] = true;
@@ -230,7 +260,7 @@ impl PointCloud {
         let chunk = &mut self.chunks[chunk_index];
         chunk.min = chunk.min.min(position - half_point);
         chunk.max = chunk.max.max(position + half_point);
-        if self.hidden[index] || self.sliced[index] {
+        if !self.renders(index) {
             return;
         }
         if !self.chunk_dirty[chunk_index] {
@@ -247,31 +277,17 @@ impl PointCloud {
     /// proportional to how many points actually flipped.
     pub fn apply_slice(&mut self, camera: Vec3, radius: f32) {
         let radius_squared = radius * radius;
-        let mut changed = false;
         for index in 0..self.positions.len() {
             let sliced =
                 radius > 0.0 && self.positions[index].distance_squared(camera) < radius_squared;
             if self.sliced[index] == sliced {
                 continue;
             }
+            let rendered = self.renders(index);
             self.sliced[index] = sliced;
-            changed = true;
-            let chunk_index = self.chunk_of_point[index] as usize;
-            let chunk = &mut self.chunks[chunk_index];
-            if !self.hidden[index] {
-                if sliced {
-                    chunk.visible_points = chunk.visible_points.saturating_sub(1);
-                } else {
-                    chunk.visible_points += 1;
-                }
+            if self.renders(index) != rendered {
+                self.point_rendering_changed(index);
             }
-            if !self.chunk_dirty[chunk_index] {
-                self.chunk_dirty[chunk_index] = true;
-                self.dirty_queue.push(chunk_index as u32);
-            }
-        }
-        if changed {
-            self.epoch += 1;
         }
     }
 
@@ -336,6 +352,7 @@ impl PointCloud {
         self.colors = layout.colors;
         self.hidden = vec![false; point_count];
         self.sliced = vec![false; point_count];
+        self.withheld = vec![false; point_count];
         self.id_to_index = layout.id_to_index;
         self.chunk_of_point = layout.chunk_of_point;
         self.cell_size = layout.cell_size;
@@ -426,6 +443,7 @@ pub fn apply_point_cloud_edits(
             &cloud.colors,
             &cloud.hidden,
             &cloud.sliced,
+            &cloud.withheld,
             &chunk.point_indices,
             cloud.point_size,
         );
@@ -480,6 +498,7 @@ fn build_chunk_mesh(
     colors: &[[f32; 4]],
     hidden: &[bool],
     sliced: &[bool],
+    withheld: &[bool],
     point_indices: &[u32],
     point_size: f32,
 ) -> Mesh {
@@ -541,9 +560,10 @@ fn build_chunk_mesh(
         ),
     ];
 
+    let renders = |point: usize| !hidden[point] && !sliced[point] && !withheld[point];
     let visible_count = point_indices
         .iter()
-        .filter(|&&point| !hidden[point as usize] && !sliced[point as usize])
+        .filter(|&&point| renders(point as usize))
         .count();
     let mut mesh_positions = Vec::with_capacity(visible_count * 24);
     let mut mesh_normals = Vec::with_capacity(visible_count * 24);
@@ -552,7 +572,7 @@ fn build_chunk_mesh(
 
     for &point in point_indices {
         let point = point as usize;
-        if hidden[point] || sliced[point] {
+        if !renders(point) {
             continue;
         }
         let center = positions[point];
@@ -933,6 +953,7 @@ mod tests {
                 &cloud.colors,
                 &cloud.hidden,
                 &cloud.sliced,
+                &cloud.withheld,
                 &chunk.point_indices,
                 cloud.point_size,
             );
@@ -1079,12 +1100,62 @@ mod tests {
         let colors = vec![[1.0, 1.0, 1.0, 1.0]; 3];
         let hidden = vec![false, true, false];
         let sliced = vec![false; 3];
-        let mesh = build_chunk_mesh(&positions, &colors, &hidden, &sliced, &[0, 1, 2], 0.2);
+        let withheld = vec![false; 3];
+        let mesh = build_chunk_mesh(
+            &positions,
+            &colors,
+            &hidden,
+            &sliced,
+            &withheld,
+            &[0, 1, 2],
+            0.2,
+        );
         assert_eq!(mesh.count_vertices(), 2 * 24);
 
         let sliced = vec![false, false, true];
-        let mesh = build_chunk_mesh(&positions, &colors, &hidden, &sliced, &[0, 1, 2], 0.2);
+        let mesh = build_chunk_mesh(
+            &positions,
+            &colors,
+            &hidden,
+            &sliced,
+            &withheld,
+            &[0, 1, 2],
+            0.2,
+        );
         assert_eq!(mesh.count_vertices(), 24);
+
+        let withheld = vec![true, false, false];
+        let mesh = build_chunk_mesh(
+            &positions,
+            &colors,
+            &hidden,
+            &sliced,
+            &withheld,
+            &[0, 1, 2],
+            0.2,
+        );
+        assert_eq!(mesh.count_vertices(), 0);
+    }
+
+    #[test]
+    fn a_withheld_point_stops_rendering_until_released_whatever_else_hides_it() {
+        let (_, mut cloud) = build_cloud(test_points(10, 1.0));
+        let visible = |cloud: &PointCloud| -> usize {
+            cloud.chunks.iter().map(|chunk| chunk.visible_points).sum()
+        };
+        cloud.set_point_withheld(3, true);
+        assert_eq!(visible(&cloud), 9);
+        // Its billboard loading and unloading meanwhile must not show it.
+        cloud.set_point_visible(3, false);
+        cloud.set_point_visible(3, true);
+        assert_eq!(visible(&cloud), 9);
+        cloud.set_point_withheld(3, false);
+        assert_eq!(visible(&cloud), 10);
+        // Released while its billboard hides it, it stays hidden.
+        cloud.set_point_visible(4, false);
+        cloud.set_point_withheld(4, true);
+        cloud.set_point_withheld(4, false);
+        assert_eq!(visible(&cloud), 9);
     }
 
     #[test]

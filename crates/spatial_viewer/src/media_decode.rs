@@ -282,18 +282,36 @@ pub fn fit_image_to_square(source: RgbaImage, max_texture_side: u32) -> Result<D
     fit_rgba_to_square(source, max_texture_side)
 }
 
-/// The poster frame a video billboard shows before it plays. Needs no frame
-/// rate: it is simply the first frame the stream decodes to.
-pub fn decode_first_video_frame(path: &Path, max_texture_side: u32) -> Result<DecodedImage> {
+/// The still frame a video billboard shows while it has no playing frame:
+/// the first frame at or after `time_seconds`, which an accurate input seek
+/// lands on. Needs no frame rate. A time with no frame after it (at or past
+/// the end) falls back to the video's first frame, so the billboard still
+/// gets a picture.
+pub fn decode_video_still(
+    path: &Path,
+    time_seconds: f32,
+    max_texture_side: u32,
+) -> Result<DecodedImage> {
     let side = video_decode_side(max_texture_side);
-    let mut frames = decode_rgba_video_frames(
-        path,
-        side,
-        None,
-        &["-frames:v".to_owned(), "1".to_owned()],
-        &letterbox_filter(side),
-    )
-    .context("failed to decode the first video frame")?;
+    let decode_at = |input_seek_seconds| {
+        decode_rgba_video_frames(
+            path,
+            side,
+            input_seek_seconds,
+            &["-frames:v".to_owned(), "1".to_owned()],
+            &letterbox_filter(side),
+        )
+    };
+    if time_seconds > 0.0 {
+        match decode_at(Some(time_seconds)) {
+            Ok(mut frames) => return Ok(DecodedImage::full(side, frames.swap_remove(0))),
+            Err(error) => eprintln!(
+                "No still at {time_seconds:.3}s in {}, showing the first frame: {error:#}",
+                path.display()
+            ),
+        }
+    }
+    let mut frames = decode_at(None).context("failed to decode the first video frame")?;
     Ok(DecodedImage::full(side, frames.swap_remove(0)))
 }
 

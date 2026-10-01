@@ -23,16 +23,19 @@ pub const JITTER_CONTROL: &str = "jitter";
 pub const SEED_CONTROL: &str = "seed";
 pub const RANDOMIZE_CONTROL: &str = "randomize";
 
-const DEFAULT_RADIUS: f64 = 24.0;
-const MIN_RADIUS: f64 = 2.0;
-const MAX_RADIUS: f64 = 200.0;
-const RADIUS_STEP: f64 = 1.0;
+// In cubes, the viewer's unit: one cube holds one image.
+const DEFAULT_RADIUS: f64 = 5.0;
+const MIN_RADIUS: f64 = 1.0;
+const MAX_RADIUS: f64 = 40.0;
+const RADIUS_STEP: f64 = 0.5;
 
 /// A point as the viewer's `ProjectionPoint` expects it.
 #[derive(Debug, Serialize)]
 pub struct ProjectionPoint {
     pub image_id: usize,
     pub path: String,
+    /// In cubes. This server has no groups, so it sends no `group_index`
+    /// and the viewer's group gap never applies.
     pub position: [f32; 3],
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -44,9 +47,6 @@ pub struct ProjectionPoint {
 #[derive(Debug, Serialize)]
 pub struct ProjectionPage {
     pub axis_labels: [Option<String>; 3],
-    pub coordinate_spacing: f32,
-    pub duplicate_spacing: f32,
-    pub sprite_world_height: f32,
     pub offset: usize,
     pub limit: usize,
     pub total: usize,
@@ -160,13 +160,7 @@ impl ServerState {
 }
 
 /// Builds the snapshot for one request.
-pub fn build_snapshot(
-    state: &ServerState,
-    controls: &Controls,
-    coordinate_spacing: f32,
-    sprite_world_height: f32,
-    limit: usize,
-) -> CatalogSnapshot {
+pub fn build_snapshot(state: &ServerState, controls: &Controls, limit: usize) -> CatalogSnapshot {
     let total = state.media.len();
     let shown = total.min(limit.max(1));
 
@@ -214,9 +208,6 @@ pub fn build_snapshot(
         panel: build_panel(state, controls, shown, total),
         projection: ProjectionPage {
             axis_labels,
-            coordinate_spacing,
-            duplicate_spacing: 0.0,
-            sprite_world_height,
             offset: 0,
             limit,
             total,
@@ -252,7 +243,7 @@ fn build_panel(
             },
             StatLine {
                 label: "radius".to_owned(),
-                value: format!("{:.0}", controls.radius),
+                value: format!("{:.1}", controls.radius),
             },
             StatLine {
                 label: "shuffles".to_owned(),
@@ -426,7 +417,7 @@ mod tests {
     }
 
     fn snapshot(state: &ServerState, controls: &Controls) -> CatalogSnapshot {
-        build_snapshot(state, controls, 6.0, 4.0, 1000)
+        build_snapshot(state, controls, 1000)
     }
 
     fn widget_ids(panel: &ControlPanel) -> Vec<&str> {
@@ -760,7 +751,7 @@ mod tests {
 
     #[test]
     fn the_limit_bounds_the_points_without_hiding_the_total() {
-        let snapshot = build_snapshot(&state(500), &controls(&[], None), 6.0, 4.0, 100);
+        let snapshot = build_snapshot(&state(500), &controls(&[], None), 100);
 
         assert_eq!(snapshot.projection.points.len(), 100);
         assert_eq!(snapshot.projection.total, 500);

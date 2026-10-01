@@ -13,37 +13,50 @@
 //! changed path) tears down decoded textures. Positions are pinned per image
 //! for the lifetime of a load by [`stabilize_streamed_projection_positions`],
 //! so a partial catalog never shuffles the scene around the player.
+//!
+//! The API places points in cube units and names their groups; the viewer
+//! lays them out under its own folder state ([`lay_out_points`]). Opening or
+//! closing a folder re-derives the current projection on a background
+//! thread ([`CatalogLoadTask::start_relayout`]) and applies it like a
+//! snapshot, so textures survive.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, sync_channel, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use spatial_api::{CatalogStreamEvent, ControlPanel, ProjectionPage};
-use spatial_geometry::{
-    api_position_to_viewer, estimate_smallest_axis_gap, projection_bounds, Bounds3,
-};
+use spatial_geometry::{bounds_of, estimate_smallest_axis_gap, Bounds3};
 use spatial_viewer_ui::{
-    BillboardControls, BillboardStats, ControlPanelState, NavigationSettings, NavigationTargets,
-    PauseMenuState, PendingSubmit, StartMenuState,
+    Animation, AnimationSettings, BillboardControls, BillboardStats, ControlPanelState,
+    NavigationSettings, NavigationTargets, PauseMenuState, PendingSubmit, StartMenuState,
+    ViewSettings,
 };
 
+use crate::arrangement_store::{ArrangementStore, SavedCamera};
 use crate::axis_gizmo::AxisGizmoLabels;
 use crate::catalog_session::save_last_catalog_roots;
-use crate::image_loading::{BillboardPoint, ImageLoadingState, PreparedPendingIndex};
+use crate::folders::{
+    lay_out_points, BillboardGrowth, BillboardMotion, FolderLayoutInput, FolderScene,
+    FolderViewState, LaidOutProjection, ManualArrangement, RetiringBillboard,
+};
+use crate::image_loading::{
+    BillboardPoint, ImageLoadingState, MediaBillboard, PreparedPendingIndex,
+};
 use crate::manual_spacing::{ImagePointIndex, SelectionHighlights, SelectionState};
 use crate::point_cloud::{point_color, PointCloud, PointCloudLayout, PointCloudPoint, ViewBounds};
 use crate::{
     axis_label, billboard_axis_labels, drop_in_background, initial_camera_distance,
-    navigation_speed, place_camera_at_initial_view, point_cloud_point_size,
-    set_scene_camera_far_plane, BillboardEntitiesQuery, ExplorerScene, FlyCameraProjectionQuery,
-    FlyCameraTransformQuery,
+    navigation_speed, place_camera_at_initial_view, place_camera_at_pose, point_cloud_point_size,
+    set_scene_camera_far_plane, BillboardEntitiesQuery, ExplorerScene, FlyCamera,
+    FlyCameraProjectionQuery, FlyCameraTransformQuery,
 };
 
 /// Result of a background catalog load kicked off from the start menu.
 pub(crate) struct LoadedCatalog {
-    pub panel: ControlPanel,
+    /// `None` for a relayout, which changes positions and nothing else.
+    pub panel: Option<ControlPanel>,
     pub projection: ProjectionPage,
     pub complete: bool,
     pub roots: Option<Vec<String>>,
@@ -53,10 +66,15 @@ pub(crate) struct LoadedCatalog {
 /// touching ECS or assets. Built on the catalog load thread so applying a
 /// snapshot on the main thread costs O(chunks), not O(points).
 pub(crate) struct PreparedProjection {
-    pub panel: ControlPanel,
+    pub panel: Option<ControlPanel>,
     pub projection: ProjectionPage,
     pub complete: bool,
     pub roots: Option<Vec<String>>,
+    /// The folder state `image_points` were laid out under; a snapshot
+    /// prepared under an outdated one is re-derived.
+    folders: FolderScene,
+    /// Likewise the [`ManualArrangement`] revision.
+    arrangement_revision: u64,
     bounds: Bounds3,
     image_points: Vec<BillboardPoint>,
     nearest_gap: Option<f32>,
@@ -71,16 +89,19 @@ pub(crate) struct PreparedProjection {
 }
 
 impl PreparedProjection {
-    fn new(loaded: LoadedCatalog) -> Self {
+    pub(crate) fn new(loaded: LoadedCatalog, input: &FolderLayoutInput) -> Self {
         let projection = loaded.projection;
-        let bounds = projection_bounds(&projection.points);
-        let image_points = projection_billboard_points(&projection);
-        let nearest_gap = estimate_smallest_axis_gap(&projection.points);
-        let navigation_targets =
-            NavigationTargets::from_positions(image_points.iter().map(|point| point.position));
+        let LaidOutProjection {
+            points: image_points,
+            folders,
+        } = lay_out_points(&projection, input);
+        let positions = || image_points.iter().map(|point| point.position);
+        let bounds = bounds_of(positions());
+        let nearest_gap = estimate_smallest_axis_gap(positions());
+        let navigation_targets = NavigationTargets::from_positions(positions());
         let point_index = ImagePointIndex::new(&image_points);
         let point_cloud_layout = PointCloudLayout::new(
-            point_cloud_points(&projection),
+            point_cloud_points(&image_points),
             point_cloud_point_size(&bounds),
         );
         let pending_index = PreparedPendingIndex::new(image_points.clone());
@@ -89,6 +110,8 @@ impl PreparedProjection {
             projection,
             complete: loaded.complete,
             roots: loaded.roots,
+            folders,
+            arrangement_revision: input.arrangement.revision,
             bounds,
             image_points,
             nearest_gap,
@@ -99,21 +122,19 @@ impl PreparedProjection {
         }
     }
 
-    /// Re-derives the snapshot with `overrides` applied to the matching
-    /// projection points. O(points), so callers reserve it for the rare
-    /// case of a manual drag during streaming.
-    fn with_position_overrides(mut self, overrides: &HashMap<usize, Vec3>) -> Self {
-        for point in &mut self.projection.points {
-            if let Some(position) = overrides.get(&point.image_id) {
-                point.position = [position.x, position.y, position.z];
-            }
-        }
-        Self::new(LoadedCatalog {
-            panel: self.panel,
-            projection: self.projection,
-            complete: self.complete,
-            roots: self.roots,
-        })
+    /// Re-derives the snapshot under `input`. O(points), so callers reserve
+    /// it for the rare case of a manual drag or a folder change while a
+    /// snapshot was in flight.
+    fn relaid_out(self, input: &FolderLayoutInput) -> Self {
+        Self::new(
+            LoadedCatalog {
+                panel: self.panel,
+                projection: self.projection,
+                complete: self.complete,
+                roots: self.roots,
+            },
+            input,
+        )
     }
 }
 
@@ -132,22 +153,58 @@ pub(crate) struct CatalogLoadTask {
     /// Only the newest is kept: an older set of values is superseded, never
     /// queued behind the new one.
     pending_submit: Option<PendingSubmit>,
-    /// Positions the user dragged images to since this load began. Applied
-    /// over the load thread's first-streamed pins so drags survive later
-    /// snapshots of the same stream.
-    pub dragged_positions: HashMap<usize, Vec3>,
+    /// What the user arranged by hand since this load began, laid out over
+    /// every later snapshot of it and every folder change.
+    arrangement: Arc<Mutex<ManualArrangement>>,
 }
 
-/// Runs on the catalog load thread: pins every image to its first streamed
-/// coordinate, then derives the scene data the main thread would otherwise
-/// compute per snapshot. Returns `false` when the viewer dropped the load.
+impl CatalogLoadTask {
+    pub(crate) fn arrangement(&self) -> MutexGuard<'_, ManualArrangement> {
+        self.arrangement.lock().expect("manual arrangement lock")
+    }
+
+    /// No load or relayout is in flight.
+    pub(crate) fn is_idle(&mut self) -> bool {
+        self.receiver
+            .get_mut()
+            .expect("catalog load task lock")
+            .is_none()
+    }
+
+    /// Re-derives `projection` under `input` on a background thread. It
+    /// arrives through [`poll_catalog_load_task`] as a snapshot that changes
+    /// which images show and where, and nothing else. Only call while idle.
+    pub(crate) fn start_relayout(&mut self, projection: ProjectionPage, input: FolderLayoutInput) {
+        let relayout = LoadedCatalog {
+            panel: None,
+            projection,
+            complete: true,
+            roots: None,
+        };
+        let (sender, receiver) = sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(Ok(PreparedProjection::new(relayout, &input)));
+        });
+        *self.receiver.get_mut().expect("catalog load task lock") = Some(receiver);
+        self.first_snapshot = false;
+        self.catalog = false;
+    }
+}
+
+/// Runs on the catalog load thread: pins every ungrouped image to its first
+/// streamed coordinate, then derives the scene data the main thread would
+/// otherwise compute per snapshot. Returns `false` when the viewer dropped
+/// the load.
 pub(crate) fn prepare_loaded_catalog(
     sender: &std::sync::mpsc::SyncSender<Result<PreparedProjection, String>>,
     stable_positions: &mut HashMap<usize, [f32; 3]>,
     mut loaded: LoadedCatalog,
+    input: &FolderLayoutInput,
 ) -> bool {
     stabilize_streamed_projection_positions(&mut loaded.projection, stable_positions);
-    sender.send(Ok(PreparedProjection::new(loaded))).is_ok()
+    sender
+        .send(Ok(PreparedProjection::new(loaded, input)))
+        .is_ok()
 }
 
 /// Lifetime guard for automatic player placement. The camera may be placed
@@ -156,6 +213,26 @@ pub(crate) fn prepare_loaded_catalog(
 #[derive(Resource, Default)]
 pub(crate) struct InitialPlayerPlacement {
     pub positioned: bool,
+    /// Where the camera was left in the view being loaded, placed instead of
+    /// the initial view.
+    pub remembered: Option<SavedCamera>,
+}
+
+impl InitialPlayerPlacement {
+    /// The camera stands where the current view put it: no load is still
+    /// to place it.
+    pub(crate) fn settled(&self) -> bool {
+        self.positioned && self.remembered.is_none()
+    }
+}
+
+/// Where a load puts the camera.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PlayerPlacement {
+    /// Looking at the first image, as a catalog first opens.
+    Initial,
+    /// Where it was left in this view.
+    Remembered(SavedCamera),
 }
 
 /// Receiver for the native folder picker dialog running on a background
@@ -182,9 +259,28 @@ pub(crate) struct CatalogMenuState<'w> {
     initial_player_placement: ResMut<'w, InitialPlayerPlacement>,
 }
 
+/// Billboards with what a relayout moves them by: where and how large they
+/// are drawn, and any motion they are already in.
+type BillboardMotionQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static MediaBillboard,
+        &'static Transform,
+        &'static BillboardGrowth,
+        Option<&'static mut BillboardMotion>,
+    ),
+    Without<FlyCamera>,
+>;
+
 #[derive(SystemParam)]
 pub(crate) struct SceneReloadQueries<'w, 's> {
     billboards: BillboardEntitiesQuery<'w, 's>,
+    /// Retained billboards spring to where a relayout moved them.
+    billboard_motion: BillboardMotionQuery<'w, 's>,
+    /// Whether a toggled folder's images leave in a stagger.
+    animations: Res<'w, AnimationSettings>,
     camera: FlyCameraTransformQuery<'w, 's>,
     camera_projection: FlyCameraProjectionQuery<'w, 's>,
 }
@@ -199,44 +295,13 @@ pub(crate) struct SceneReloadAssets<'w> {
     images: ResMut<'w, Assets<Image>>,
 }
 
-pub(crate) fn point_cloud_points(projection: &spatial_api::ProjectionPage) -> Vec<PointCloudPoint> {
-    projection
-        .points
+pub(crate) fn point_cloud_points(image_points: &[BillboardPoint]) -> Vec<PointCloudPoint> {
+    image_points
         .iter()
-        .map(|point| {
-            let position = api_position_to_viewer(point.position);
-            PointCloudPoint {
-                image_id: point.image_id,
-                position: Vec3::new(position.x, position.y, position.z),
-                color: point_color(point.image_id),
-            }
-        })
-        .collect()
-}
-
-pub(crate) fn projection_billboard_points(
-    projection: &spatial_api::ProjectionPage,
-) -> Vec<BillboardPoint> {
-    projection
-        .points
-        .iter()
-        .map(|point| {
-            let position = api_position_to_viewer(point.position);
-            BillboardPoint {
-                image_id: point.image_id,
-                path: Arc::from(point.path.as_str()),
-                position: Vec3::new(position.x, position.y, position.z),
-                is_video: point.media_type == "video",
-                duration_seconds: point.duration_seconds,
-                source_size: point
-                    .width
-                    .zip(point.height)
-                    .map(|(width, height)| UVec2::new(width, height)),
-                coordinate_labels: point
-                    .coordinate_labels
-                    .clone()
-                    .map(|label| label.map(Arc::from)),
-            }
+        .map(|point| PointCloudPoint {
+            image_id: point.image_id,
+            position: point.position,
+            color: point_color(point.image_id),
         })
         .collect()
 }
@@ -261,14 +326,19 @@ pub(crate) fn restore_last_catalog(
     pause_menu.open_catalog_options_screen();
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_start_menu_requests(
     mut start_menu: ResMut<StartMenuState>,
     mut pause_menu: ResMut<PauseMenuState>,
     scene: Res<ExplorerScene>,
     controls: Res<ControlPanelState>,
+    mut folder_view: ResMut<FolderViewState>,
     mut folder_pick_task: ResMut<FolderPickTask>,
     mut catalog_load_task: ResMut<CatalogLoadTask>,
+    mut arrangements: ResMut<ArrangementStore>,
     last_folder: Res<LastPickedFolder>,
+    view_settings: Res<ViewSettings>,
+    mut initial_player_placement: ResMut<InitialPlayerPlacement>,
 ) {
     if start_menu.take_use_current_request() {
         pause_menu.back();
@@ -308,11 +378,7 @@ pub(crate) fn handle_start_menu_requests(
         start_menu.set_status("Add at least one folder first.");
         return;
     }
-    let load_slot = catalog_load_task
-        .receiver
-        .get_mut()
-        .expect("catalog load task lock");
-    if load_slot.is_some() {
+    if !catalog_load_task.is_idle() {
         return;
     }
 
@@ -326,6 +392,29 @@ pub(crate) fn handle_start_menu_requests(
         .projection_request()
         .with_roots(start_menu.roots.clone())
         .with_controls(controls.values().clone(), None);
+    // A catalog opens with every folder closed, arranged as the user left
+    // this view.
+    folder_view.reset();
+    arrangements.switch_view(
+        ArrangementStore::view_key(&start_menu.roots, controls.values()),
+        &mut catalog_load_task.arrangement(),
+        &scene.projection,
+        scene.folders.origin,
+    );
+    // Back where the camera was left in this view, once its layout arrives.
+    let remembered = arrangements
+        .current_camera()
+        .filter(|_| view_settings.remember_camera);
+    if remembered.is_some() {
+        initial_player_placement.positioned = false;
+    }
+    initial_player_placement.remembered = remembered;
+    let input = folder_view.layout_input(
+        scene.billboard_world_size,
+        &FolderScene::default(),
+        &catalog_load_task.arrangement(),
+    );
+    let arrangement = catalog_load_task.arrangement.clone();
     std::thread::spawn(move || {
         let mut stable_positions = HashMap::new();
         let result = client.stream_catalog(&request, |event| match event {
@@ -338,11 +427,12 @@ pub(crate) fn handle_start_menu_requests(
                 &sender,
                 &mut stable_positions,
                 LoadedCatalog {
-                    panel,
+                    panel: Some(panel),
                     projection: *projection,
                     complete,
                     roots: Some(roots),
                 },
+                &input.with_arrangement(&arrangement.lock().expect("manual arrangement lock")),
             ),
             CatalogStreamEvent::Error { message } => sender.send(Err(message)).is_ok(),
             CatalogStreamEvent::Heartbeat => true,
@@ -351,13 +441,39 @@ pub(crate) fn handle_start_menu_requests(
             let _ = sender.send(Err(error));
         }
     });
-    *load_slot = Some(receiver);
+    *catalog_load_task
+        .receiver
+        .get_mut()
+        .expect("catalog load task lock") = Some(receiver);
     catalog_load_task.first_snapshot = true;
     catalog_load_task.catalog = true;
     catalog_load_task.pending_submit = None;
-    catalog_load_task.dragged_positions.clear();
     start_menu.loading = true;
     start_menu.set_status("Loading catalog...");
+}
+
+/// Puts the catalog back as it first opened when "Reset layout" is pressed:
+/// nothing arranged by hand in this view (one undo step brings it back),
+/// every folder closed and laid out from the layout's own origin, nothing
+/// selected, and the camera placed again once the new layout arrives.
+pub(crate) fn reset_catalog_layout(
+    mut start_menu: ResMut<StartMenuState>,
+    task: Res<CatalogLoadTask>,
+    mut folder_view: ResMut<FolderViewState>,
+    mut selection: ResMut<SelectionState>,
+    mut initial_player_placement: ResMut<InitialPlayerPlacement>,
+) {
+    if !start_menu.take_reset_layout_request() {
+        return;
+    }
+    task.arrangement().clear();
+    folder_view.reset_to_first_open();
+    selection.clear();
+    initial_player_placement.positioned = false;
+    initial_player_placement.remembered = None;
+    start_menu.set_status(
+        "Layout reset as the catalog first opened. Undo brings back what you arranged.",
+    );
 }
 
 pub(crate) fn poll_folder_pick_task(
@@ -391,6 +507,7 @@ pub(crate) fn poll_catalog_load_task(
     mut catalog_load_task: ResMut<CatalogLoadTask>,
     mut menu: CatalogMenuState,
     mut controls: ResMut<ControlPanelState>,
+    mut folder_view: ResMut<FolderViewState>,
     mut scene: ResMut<ExplorerScene>,
     billboard_controls: Res<BillboardControls>,
     mut loading_state: ResMut<ImageLoadingState>,
@@ -417,20 +534,30 @@ pub(crate) fn poll_catalog_load_task(
     };
     match result {
         Ok(mut loaded) => {
-            // The load thread pinned every image to its first streamed
-            // coordinate. Manual drags happen here on the main thread, so
-            // images moved since this load began override that pin; the
-            // derived scene data is re-derived only when a drag happened.
-            if !catalog_load_task.dragged_positions.is_empty() {
-                loaded = loaded.with_position_overrides(&catalog_load_task.dragged_positions);
+            // An image may have been moved, or a folder made, opened or
+            // closed, while the snapshot was being laid out; only then is it
+            // laid out again, here.
+            if loaded.arrangement_revision != catalog_load_task.arrangement().revision()
+                || loaded.folders.revision != folder_view.revision()
+            {
+                let input = folder_view.layout_input(
+                    scene.billboard_world_size,
+                    &scene.folders,
+                    &catalog_load_task.arrangement(),
+                );
+                loaded = loaded.relaid_out(&input);
             }
             let first_snapshot = catalog_load_task.first_snapshot;
-            let position_player =
-                !menu.initial_player_placement.positioned && !loaded.projection.points.is_empty();
+            let placement = &mut menu.initial_player_placement;
+            let player_placement = (!placement.positioned && !loaded.projection.points.is_empty())
+                .then(|| {
+                    placement.positioned = true;
+                    placement
+                        .remembered
+                        .take()
+                        .map_or(PlayerPlacement::Initial, PlayerPlacement::Remembered)
+                });
             catalog_load_task.first_snapshot = false;
-            if position_player {
-                menu.initial_player_placement.positioned = true;
-            }
             if loaded.complete {
                 *catalog_load_task
                     .receiver
@@ -462,7 +589,7 @@ pub(crate) fn poll_catalog_load_task(
                 &mut scene_queries,
                 loaded,
                 reset,
-                position_player,
+                player_placement,
             );
             menu.start_menu.set_status(catalog_load_status(
                 scene.projection.points.len(),
@@ -518,24 +645,26 @@ pub(crate) fn projection_preserves_billboards(
     })
 }
 
-/// A partial catalog does not yet know the final dimension extents, so a
-/// freshly recomputed projection may move records that were already shown.
-/// Give every image its first streamed coordinate for the lifetime of this
-/// load; newly discovered images still appear immediately at their own first
 /// A partial catalog does not yet know its final extents, so a freshly
 /// recomputed projection may move records that were already shown. Give every
-/// image its first streamed coordinate for the lifetime of this load; newly
-/// discovered images still appear immediately at their own first coordinate
-/// without shifting the existing scene around the player.
+/// ungrouped image its first streamed coordinate for the lifetime of this
+/// load; newly discovered images still appear immediately at their own first
+/// coordinate without shifting the existing scene around the player.
+///
+/// Grouped images are laid out by the viewer from their group's slot, which
+/// a newly discovered value can shift: pinning them would stack two groups
+/// in one slot. They move instead, springing to their new places.
 pub(crate) fn stabilize_streamed_projection_positions(
     projection: &mut ProjectionPage,
     stable_positions: &mut HashMap<usize, [f32; 3]>,
 ) {
     for point in &mut projection.points {
-        let stable = stable_positions
+        if point.group.is_some() {
+            continue;
+        }
+        point.position = *stable_positions
             .entry(point.image_id)
             .or_insert(point.position);
-        point.position = *stable;
     }
 }
 
@@ -561,7 +690,7 @@ pub(crate) fn apply_projection_to_scene(
     scene_queries: &mut SceneReloadQueries,
     prepared: PreparedProjection,
     reset_billboards: bool,
-    position_player: bool,
+    player_placement: Option<PlayerPlacement>,
 ) {
     if reset_billboards {
         for (entity, billboard) in scene_queries.billboards.iter() {
@@ -573,6 +702,7 @@ pub(crate) fn apply_projection_to_scene(
     let PreparedProjection {
         panel,
         projection,
+        folders,
         bounds,
         image_points,
         nearest_gap,
@@ -582,14 +712,11 @@ pub(crate) fn apply_projection_to_scene(
         pending_index,
         ..
     } = prepared;
-    let nearest_gap = nearest_gap.unwrap_or(scene.coordinate_spacing);
-    let camera_speed = navigation_speed(nearest_gap, scene.coordinate_spacing);
-    let navigation_reference_distance = scene
-        .coordinate_spacing
-        .max(scene.billboard_world_size)
-        .max(1.0);
-    let initial_view_distance =
-        initial_camera_distance(scene.coordinate_spacing, scene.billboard_world_size);
+    let cell = scene.billboard_world_size;
+    let nearest_gap = nearest_gap.unwrap_or(cell);
+    let camera_speed = navigation_speed(nearest_gap, cell);
+    let navigation_reference_distance = cell.max(scene.billboard_world_size).max(1.0);
+    let initial_view_distance = initial_camera_distance(cell, scene.billboard_world_size);
     let axis_labels = projection.axis_labels.clone().map(axis_label);
 
     cloud.rebuild_from_layout(commands, meshes, materials, point_cloud_layout);
@@ -606,11 +733,34 @@ pub(crate) fn apply_projection_to_scene(
             billboard_controls.max_texture_side,
         );
     } else {
-        loading_state.update_points(image_points.clone());
         drop_in_background(pending_index);
+        // `projection_preserves_billboards` already vetted every identity.
+        let retired = loading_state
+            .update_points(image_points.clone())
+            .expect("a preserving snapshot keeps every billboard's identity");
+        for billboard in retired {
+            // Back into the folder that now hides it, from the size it is
+            // drawn at, grown or part way through a move.
+            let target = folders
+                .folder_of(billboard.image_id)
+                .map_or(billboard.position, |folder| folder.center);
+            let drawn_scale = scene_queries
+                .billboard_motion
+                .get(billboard.entity)
+                .map_or(billboard.scale, |(_, _, transform, _, _)| transform.scale.x);
+            commands
+                .entity(billboard.entity)
+                .remove::<(MediaBillboard, BillboardMotion, BillboardGrowth)>()
+                .insert(RetiringBillboard::new(
+                    target,
+                    drawn_scale,
+                    billboard.surface_assets,
+                ));
+        }
         for (_, billboard) in scene_queries.billboards.iter() {
             cloud.set_point_visible(billboard.image_id, false);
         }
+        follow_loaded_points(commands, loading_state, &folders, cell, scene_queries);
     }
     drop_in_background(std::mem::replace(navigation_targets, prepared_targets));
     // Manual selection state points at billboards of the outgoing projection;
@@ -620,10 +770,15 @@ pub(crate) fn apply_projection_to_scene(
         commands.insert_resource(SelectionState::default());
         commands.insert_resource(SelectionHighlights::default());
     }
-    if position_player {
-        navigation_settings.base_speed = camera_speed;
+    if let Some(placement) = player_placement {
+        match placement {
+            PlayerPlacement::Initial => navigation_settings.base_speed = camera_speed,
+            PlayerPlacement::Remembered(camera) => {
+                navigation_settings.set_base_speed(camera.base_speed);
+            }
+        }
         navigation_settings.retarget_reference_distance(navigation_reference_distance);
-        navigation_settings.status.effective_speed = camera_speed;
+        navigation_settings.status.effective_speed = navigation_settings.base_speed;
     }
     *billboard_stats = BillboardStats {
         entity_count: image_points.len(),
@@ -631,6 +786,8 @@ pub(crate) fn apply_projection_to_scene(
         ..default()
     };
 
+    scene.folders = folders;
+    scene.folder_generation += 1;
     scene.bounds = bounds;
     drop_in_background(std::mem::replace(&mut scene.image_points, image_points));
     scene.camera_speed = camera_speed;
@@ -639,33 +796,75 @@ pub(crate) fn apply_projection_to_scene(
     scene.axis_labels = axis_labels;
     commands.insert_resource(billboard_axis_labels(&projection.axis_labels));
     drop_in_background(std::mem::replace(&mut scene.projection, projection));
-    controls.apply_panel(panel, scene.projection.points.len(), scene.projection.total);
-    // A `--control` naming something this server does not publish would
-    // otherwise be silently ignored, leaving a scripted run looking correct
-    // while using a different value than it asked for.
-    let unknown = controls.take_unknown_initial_controls();
-    if !unknown.is_empty() {
-        controls.set_request_error(format!("Unknown --control: {}", unknown.join(", ")));
-        eprintln!(
-            "This API does not offer these controls: {}. Open the View pill to see what it does offer.",
-            unknown.join(", ")
-        );
+    if let Some(panel) = panel {
+        controls.apply_panel(panel, scene.projection.points.len(), scene.projection.total);
+        // A `--control` naming something this server does not publish would
+        // otherwise be silently ignored, leaving a scripted run looking
+        // correct while using a different value than it asked for.
+        let unknown = controls.take_unknown_initial_controls();
+        if !unknown.is_empty() {
+            controls.set_request_error(format!("Unknown --control: {}", unknown.join(", ")));
+            eprintln!(
+                "This API does not offer these controls: {}. Open the View pill to see what it does offer.",
+                unknown.join(", ")
+            );
+        }
     }
 
-    if let (true, Some(point), Ok((mut transform, mut camera))) = (
-        position_player,
-        scene.projection.points.first(),
-        scene_queries.camera.get_single_mut(),
-    ) {
-        place_camera_at_initial_view(
-            &mut transform,
-            &mut camera,
-            api_position_to_viewer(point.position),
-            scene.initial_view_distance,
-        );
+    if let (Some(placement), Ok((mut transform, mut camera))) =
+        (player_placement, scene_queries.camera.get_single_mut())
+    {
+        match placement {
+            PlayerPlacement::Initial => {
+                if let Some(point) = scene.image_points.first() {
+                    place_camera_at_initial_view(
+                        &mut transform,
+                        &mut camera,
+                        point.position,
+                        scene.initial_view_distance,
+                    );
+                }
+            }
+            PlayerPlacement::Remembered(saved) => place_camera_at_pose(
+                &mut transform,
+                &mut camera,
+                scene.folders.origin + Vec3::from_array(saved.position),
+                saved.yaw,
+                saved.pitch,
+            ),
+        }
     }
     if let Ok(mut camera_projection) = scene_queries.camera_projection.get_single_mut() {
         set_scene_camera_far_plane(&mut camera_projection, scene.bounds.max_extent);
+    }
+}
+
+/// Starts every retained billboard springing to where and how large its
+/// loaded record now says it belongs. The images of a folder just toggled
+/// leave in a stagger, nearest to its center first, while folders animate
+/// opening and closing.
+fn follow_loaded_points(
+    commands: &mut Commands,
+    loading_state: &ImageLoadingState,
+    folders: &FolderScene,
+    cube_size: f32,
+    scene_queries: &mut SceneReloadQueries,
+) {
+    let staggers = scene_queries.animations.plays(Animation::FolderSlide);
+    for (entity, billboard, transform, growth, motion) in &mut scene_queries.billboard_motion {
+        let Some(point) = loading_state.loaded_point(billboard.image_id) else {
+            continue;
+        };
+        let layout_scale = transform.scale.x / growth.factor();
+        if point.position == transform.translation && point.scale == layout_scale {
+            continue;
+        }
+        let delay = if staggers {
+            folders.stagger_seconds(billboard.image_id, point.position, cube_size)
+        } else {
+            0.0
+        };
+        BillboardMotion::retarget(commands, entity, motion, delay);
     }
 }
 
@@ -676,9 +875,11 @@ pub(crate) fn apply_projection_to_scene(
 /// values go out exactly as the panel holds them.
 pub(crate) fn apply_control_submit_requests(
     mut controls: ResMut<ControlPanelState>,
+    mut folder_view: ResMut<FolderViewState>,
     scene: Res<ExplorerScene>,
     start_menu: Res<StartMenuState>,
     mut task: ResMut<CatalogLoadTask>,
+    mut arrangements: ResMut<ArrangementStore>,
 ) {
     // Keep only the newest submission and at most one request in flight, so
     // holding down a button cannot queue a backlog of reprojections.
@@ -697,11 +898,24 @@ pub(crate) fn apply_control_submit_requests(
         return;
     };
 
+    // A new projection starts from the origin, arranged as the user left
+    // this view; folders that keep their key under it stay open.
+    arrangements.switch_view(
+        ArrangementStore::view_key(&start_menu.roots, &submit.values),
+        &mut task.arrangement(),
+        &scene.projection,
+        scene.folders.origin,
+    );
     let request = scene
         .projection_request()
         .with_roots(start_menu.roots.clone())
         .with_controls(submit.values, submit.activated);
     let client = scene.client.clone();
+    let input = folder_view.layout_input(
+        scene.billboard_world_size,
+        &FolderScene::default(),
+        &task.arrangement(),
+    );
     let (sender, receiver) = sync_channel(1);
     std::thread::spawn(move || match client.projection(&request) {
         Ok(snapshot) => {
@@ -709,11 +923,12 @@ pub(crate) fn apply_control_submit_requests(
                 &sender,
                 &mut HashMap::new(),
                 LoadedCatalog {
-                    panel: snapshot.panel,
+                    panel: Some(snapshot.panel),
                     projection: snapshot.projection,
                     complete: true,
                     roots: None,
                 },
+                &input,
             );
         }
         Err(error) => {
@@ -723,7 +938,6 @@ pub(crate) fn apply_control_submit_requests(
     *task.receiver.get_mut().expect("catalog load task lock") = Some(receiver);
     task.first_snapshot = true;
     task.catalog = false;
-    task.dragged_positions.clear();
 }
 
 /// Opens a native folder picker, preferring `pwsh` (PowerShell 7 / .NET
@@ -813,8 +1027,11 @@ mod tests {
             "Loaded 52000 points; showing 10000 (--limit)."
         );
     }
+    use crate::folders::{apply_folder_changes, FolderKey, ManualPlacement, FOLDER_PREVIEW_SCALE};
     use crate::tests::test_scene;
     use crate::{FlyCamera, CAMERA_VELOCITY_RESPONSE_PER_SECOND};
+    use spatial_api::PointGroup;
+    use spatial_viewer_ui::BillboardFacingSettings;
     use std::sync::mpsc::sync_channel;
 
     fn test_snapshot(points: &[(usize, [f32; 3])], complete: bool) -> LoadedCatalog {
@@ -824,6 +1041,7 @@ mod tests {
             .map(|&(image_id, position)| spatial_api::ProjectionPoint {
                 image_id,
                 position,
+                group: None,
                 path: format!("{image_id}.png"),
                 width: Some(64),
                 height: Some(64),
@@ -834,22 +1052,30 @@ mod tests {
             .collect();
         projection.total = points.len();
         LoadedCatalog {
-            panel: ControlPanel::default(),
+            panel: Some(ControlPanel::default()),
             projection,
             complete,
             roots: None,
         }
     }
 
-    #[test]
-    fn streamed_snapshots_position_player_once_and_keep_camera_during_updates() {
+    /// Everything `poll_catalog_load_task` and `apply_folder_changes` read,
+    /// with a camera and a load task fed by the returned sender.
+    fn catalog_app() -> (
+        App,
+        Entity,
+        std::sync::mpsc::SyncSender<Result<PreparedProjection, String>>,
+    ) {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.insert_resource(test_scene());
         app.insert_resource(ControlPanelState::default());
+        app.init_resource::<FolderViewState>();
         app.init_resource::<StartMenuState>();
         app.init_resource::<PauseMenuState>();
+        app.init_resource::<AnimationSettings>();
         app.insert_resource(BillboardControls::new(8, 64));
+        app.init_resource::<BillboardFacingSettings>();
         app.init_resource::<BillboardStats>();
         app.insert_resource(NavigationSettings::new(2.0, 6.0));
         app.insert_resource(NavigationTargets::from_positions([]));
@@ -879,11 +1105,65 @@ mod tests {
             first_snapshot: true,
             catalog: true,
             pending_submit: None,
-            dragged_positions: HashMap::new(),
+            arrangement: Arc::default(),
         });
         app.init_resource::<InitialPlayerPlacement>();
         app.init_resource::<AxisGizmoLabels>();
-        app.add_systems(Update, poll_catalog_load_task);
+        app.add_systems(
+            Update,
+            (poll_catalog_load_task, apply_folder_changes).chain(),
+        );
+        (app, camera, sender)
+    }
+
+    #[test]
+    fn a_remembered_camera_is_placed_instead_of_the_initial_view() {
+        let (mut app, camera, sender) = catalog_app();
+        let saved = SavedCamera {
+            position: [3.0, -2.0, 40.0],
+            yaw: 0.7,
+            pitch: -0.3,
+            base_speed: 9.0,
+        };
+        app.world_mut()
+            .resource_mut::<InitialPlayerPlacement>()
+            .remembered = Some(saved);
+        let input = FolderViewState::default().layout_input(
+            test_scene().billboard_world_size,
+            &FolderScene::default(),
+            &ManualArrangement::default(),
+        );
+        assert!(prepare_loaded_catalog(
+            &sender,
+            &mut HashMap::new(),
+            test_snapshot(&[(0, [100.0, 20.0, 30.0])], true),
+            &input,
+        ));
+        app.update();
+        let transform = app.world().get::<Transform>(camera).unwrap();
+        let origin = app.world().resource::<ExplorerScene>().folders.origin;
+        assert!(
+            transform
+                .translation
+                .distance(origin + Vec3::new(3.0, -2.0, 40.0))
+                < 1e-4
+        );
+        let fly_camera = app.world().get::<FlyCamera>(camera).unwrap();
+        assert_eq!((fly_camera.yaw, fly_camera.pitch), (0.7, -0.3));
+        assert_eq!(app.world().resource::<NavigationSettings>().base_speed, 9.0);
+        let placement = app.world().resource::<InitialPlayerPlacement>();
+        assert!(placement.settled());
+    }
+
+    #[test]
+    fn streamed_snapshots_position_player_once_and_keep_camera_during_updates() {
+        let (mut app, camera, sender) = catalog_app();
+        let cube_size = test_scene().billboard_world_size;
+        let input = FolderViewState::default().layout_input(
+            cube_size,
+            &FolderScene::default(),
+            &ManualArrangement::default(),
+        );
         // Snapshots go through the same stabilising preparation the load
         // thread applies, sharing one pin map across the stream.
         let mut stable_positions = HashMap::new();
@@ -891,10 +1171,18 @@ mod tests {
             &sender,
             &mut stable_positions,
             test_snapshot(&[(0, [100.0, 20.0, 30.0])], false),
+            &input,
         ));
         app.update();
+        let first_world = Vec3::new(100.0, 20.0, 30.0) * cube_size;
+        let distance = initial_camera_distance(cube_size, cube_size);
         let initial = *app.world().get::<Transform>(camera).unwrap();
-        assert_eq!(initial.translation, Vec3::new(115.0, 26.75, 45.0));
+        assert!(
+            initial
+                .translation
+                .distance(first_world + Vec3::new(distance, distance * 0.45, distance))
+                < 1e-3
+        );
         assert_eq!(
             app.world()
                 .resource::<ExplorerScene>()
@@ -913,6 +1201,7 @@ mod tests {
             &sender,
             &mut stable_positions,
             test_snapshot(&[(0, [200.0, 20.0, 30.0]), (1, [300.0, 20.0, 30.0])], true,),
+            &input,
         ));
         app.update();
         assert_eq!(
@@ -920,13 +1209,138 @@ mod tests {
             moved
         );
         assert_eq!(
-            app.world().resource::<ExplorerScene>().image_points[0]
-                .position
-                .x,
-            100.0
+            app.world().resource::<ExplorerScene>().image_points[0].position,
+            first_world
         );
         assert_eq!(app.world().resource::<PointCloud>().point_count(), 2);
         assert!(!app.world().resource::<StartMenuState>().loading);
+    }
+
+    /// Runs frames until the scene has caught up with the folder state.
+    fn settle_folders(app: &mut App) {
+        for _ in 0..500 {
+            app.update();
+            let revision = app.world().resource::<FolderViewState>().revision();
+            if app.world().resource::<ExplorerScene>().folders.revision == revision {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("the folder relayout never arrived");
+    }
+
+    #[test]
+    fn opening_a_folder_reveals_its_images_and_keeps_drags() {
+        let (mut app, _camera, sender) = catalog_app();
+        let mut snapshot = test_snapshot(
+            &[
+                (0, [0.0; 3]),
+                (1, [0.0; 3]),
+                (2, [0.0; 3]),
+                (3, [0.0; 3]),
+                (4, [0.0; 3]),
+            ],
+            true,
+        );
+        for (point, offset) in snapshot
+            .projection
+            .points
+            .iter_mut()
+            .zip([-2.0, -1.0, 0.0, 1.0, 2.0])
+        {
+            point.group = Some(PointGroup {
+                key: "folder".to_owned(),
+                index: [0, 0, 0],
+                offset: [offset, 0.0, 0.0],
+            });
+        }
+        let cube_size = test_scene().billboard_world_size;
+        let input = FolderViewState::default().layout_input(
+            cube_size,
+            &FolderScene::default(),
+            &ManualArrangement::default(),
+        );
+        assert!(prepare_loaded_catalog(
+            &sender,
+            &mut HashMap::new(),
+            snapshot,
+            &input
+        ));
+        app.update();
+
+        // Closed: four previews, small, and the fifth image hidden.
+        let scene = app.world().resource::<ExplorerScene>();
+        assert_eq!(scene.image_points.len(), 4);
+        assert!(scene.image_points.iter().all(|point| point.scale < 1.0));
+        let folder = scene
+            .folders
+            .get(&FolderKey::group("folder"))
+            .unwrap()
+            .clone();
+        let hidden = (0..5)
+            .find(|image_id| !folder.previews.contains(image_id))
+            .unwrap();
+
+        let dragged = Vec3::new(0.0, 40.0, 0.0);
+        app.world()
+            .resource::<CatalogLoadTask>()
+            .arrangement()
+            .place(folder.previews[0], ManualPlacement::Loose(dragged));
+        app.world_mut()
+            .resource_mut::<FolderViewState>()
+            .toggle(&folder.key, 0.0);
+        settle_folders(&mut app);
+
+        let scene = app.world().resource::<ExplorerScene>();
+        let point = |image_id: usize| {
+            scene
+                .image_points
+                .iter()
+                .find(|point| point.image_id == image_id)
+                .unwrap()
+        };
+        assert_eq!(scene.image_points.len(), 5);
+        assert_eq!(point(hidden).scale, 1.0);
+        // Where its folder, now four images wide, packs it.
+        let opened = scene.folders.get(&folder.key).unwrap();
+        let (_, offset) = opened
+            .members
+            .iter()
+            .find(|(image_id, _)| *image_id == hidden)
+            .unwrap();
+        assert_eq!(point(hidden).position, opened.home + *offset * cube_size);
+        // The toggled folder stays where it was.
+        assert_eq!(
+            scene
+                .folders
+                .get(&FolderKey::group("folder"))
+                .unwrap()
+                .center,
+            folder.center
+        );
+        assert_eq!(point(folder.previews[0]).position, dragged);
+        assert_eq!(app.world().resource::<PointCloud>().point_count(), 5);
+
+        // Closed again, the folder holds the four images left in it, all of
+        // them previews now; the dragged one stays where it was put.
+        app.world_mut()
+            .resource_mut::<FolderViewState>()
+            .toggle(&folder.key, 1.0);
+        settle_folders(&mut app);
+        let scene = app.world().resource::<ExplorerScene>();
+        let closed = scene.folders.get(&folder.key).unwrap();
+        assert_eq!(closed.members.len(), 4);
+        assert!(closed.previews.contains(&hidden));
+        assert!(!closed.previews.contains(&folder.previews[0]));
+        let point = |image_id: usize| {
+            scene
+                .image_points
+                .iter()
+                .find(|point| point.image_id == image_id)
+                .unwrap()
+        };
+        assert_eq!(point(hidden).scale, FOLDER_PREVIEW_SCALE);
+        assert_eq!(point(folder.previews[0]).position, dragged);
     }
 
     #[test]

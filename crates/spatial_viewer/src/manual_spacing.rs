@@ -34,10 +34,19 @@
 //! centroid, distance-scaled to constant screen size — offers precise
 //! single-axis moves, Blender-style: dragging an arrow tracks the point on
 //! that axis closest to the cursor ray, leaving the other two coordinates
-//! untouched. With "Snap drag to grid" enabled the gizmo steps live on a
-//! grid whose cell is the billboard's world size (the displayed image
-//! square), so separately placed items land exactly flush against one
-//! another; a free drag snaps to the same grid on release.
+//! untouched. With "Snap drag to grid" enabled the gizmo steps live on the
+//! layout grid — one cube per step — so separately placed items sit flush,
+//! exactly as far apart as the layout's own neighbours; a free drag snaps to
+//! the same grid on release.
+//!
+//! A press on a folder toggles it instead of selecting anything (see
+//! [`crate::folders`]), and Shift+click selects or deselects the folder
+//! instead. Selected folders move with the selection, everything inside
+//! them included; pressing one grabs the selection, and clicking it still
+//! opens or closes it. A dropped item or folder belongs to the folder whose
+//! cube it was dropped in, or to none, and is remembered that way: out of
+//! every folder it stays where it was put while folders open and close
+//! around it, and in one it moves with that folder.
 
 use std::collections::{HashMap, HashSet};
 
@@ -51,12 +60,17 @@ use bevy::render::camera::{ClearColorConfig, RenderTarget};
 use bevy::render::view::RenderLayers;
 use bevy::window::PrimaryWindow;
 use spatial_viewer_ui::{
-    BillboardControls, BillboardFacingAxis, BillboardFacingSettings, NavigationTargets,
-    PauseMenuState, RenderResolutionSettings, UiInputCapture,
+    Action, BillboardControls, BillboardFacingAxis, BillboardFacingSettings, ControlInput,
+    NavigationTargets, PauseMenuState, RenderResolutionSettings, SelectionBox, UiInputCapture,
 };
 
 use crate::axis_gizmo::cursor_over_axis_gizmo;
 use crate::catalog_load::CatalogLoadTask;
+use crate::folder_labels::{FolderHandleHit, FolderHandleKind, FolderHandles};
+use crate::folders::{
+    settle_drops, DropTargets, FolderKey, FolderScene, FolderShell, FolderViewState,
+    ManualPlacement,
+};
 use crate::image_loading::{
     billboard_rotation, BillboardPoint, BillboardWorldSize, ImageLoadingState, MediaBillboard,
 };
@@ -121,14 +135,25 @@ struct PressState {
     moved_any: bool,
 }
 
-enum PressKind {
-    /// A press over a billboard: the selection changed on press (see
-    /// [`SelectionState::press_billboard`]), a quick motionless release
-    /// applies `release`, and a drag past the motion threshold free-moves
-    /// the selection around the player, glued to the cursor ray.
+/// What a press on the selection grabbed.
+enum Grabbed {
+    /// A billboard: the selection changed on press (see
+    /// [`SelectionState::press_billboard`]), and a click applies `release`.
     Billboard {
         image_id: usize,
         release: ClickRelease,
+    },
+    /// A selected folder, by its cube (a click opens or closes it, as on any
+    /// folder) or by its tag (a click leaves it as it is).
+    Folder { key: FolderKey, click_toggles: bool },
+}
+
+enum PressKind {
+    /// A press over a billboard or a selected folder: a quick motionless
+    /// release is a click on it, and a drag past the motion threshold
+    /// free-moves the selection around the player, glued to the cursor ray.
+    Item {
+        grabbed: Grabbed,
         /// Real-time seconds when the press began, telling a click from a
         /// hold.
         pressed_at_seconds: f32,
@@ -150,6 +175,19 @@ enum PressKind {
         /// Where the player was last frame, so flight during the drag
         /// carries the selection by the same displacement.
         last_camera_position: Vec3,
+    },
+    /// A press on empty world: a click clears the selection (unless it
+    /// extends it), and a drag selects what the box dragged out holds.
+    Box {
+        /// Where the press began, in logical window pixels.
+        start: Vec2,
+        /// Adds to the selection held when the press began, instead of
+        /// replacing it.
+        extend: bool,
+        before_images: HashSet<usize>,
+        before_folders: HashSet<FolderKey>,
+        accumulated_motion: f32,
+        dragging: bool,
     },
     /// A press on a translate-gizmo arrow: the selection translates rigidly
     /// along one world axis. Cursor motion is projected onto the axis's
@@ -188,12 +226,60 @@ enum ClickRelease {
 #[derive(Resource, Default)]
 pub struct SelectionState {
     selected: HashSet<usize>,
+    /// Folders selected to be moved.
+    folders: HashSet<FolderKey>,
     press: Option<PressState>,
 }
 
 impl SelectionState {
     pub fn is_selected(&self, image_id: usize) -> bool {
         self.selected.contains(&image_id)
+    }
+
+    pub(crate) fn is_folder_selected(&self, key: &FolderKey) -> bool {
+        self.folders.contains(key)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.selected.is_empty() && self.folders.is_empty()
+    }
+
+    /// Selects the folder and nothing else.
+    pub(crate) fn select_only_folder(&mut self, key: FolderKey) {
+        self.selected.clear();
+        self.folders.clear();
+        self.folders.insert(key);
+    }
+
+    /// Selects these images and nothing else.
+    pub(crate) fn select_only_images(&mut self, image_ids: impl IntoIterator<Item = usize>) {
+        self.selected = image_ids.into_iter().collect();
+        self.folders.clear();
+    }
+
+    /// Selects these images and folders and nothing else.
+    fn select_only(
+        &mut self,
+        image_ids: impl IntoIterator<Item = usize>,
+        folders: impl IntoIterator<Item = FolderKey>,
+    ) {
+        self.selected = image_ids.into_iter().collect();
+        self.folders = folders.into_iter().collect();
+    }
+
+    /// Shift+click on a folder: adds it to the selection, or takes it out.
+    fn toggle_folder(&mut self, key: FolderKey) {
+        if !self.folders.remove(&key) {
+            self.folders.insert(key);
+        }
+    }
+
+    pub(crate) fn selected_folders(&self) -> impl Iterator<Item = &FolderKey> + '_ {
+        self.folders.iter()
+    }
+
+    pub(crate) fn deselect_folder(&mut self, key: &FolderKey) {
+        self.folders.remove(key);
     }
 
     /// Applies a press on a billboard and returns what a click then does. An
@@ -207,6 +293,7 @@ impl SelectionState {
         }
         if !extend {
             self.selected.clear();
+            self.folders.clear();
         }
         self.selected.insert(image_id);
         ClickRelease::Keep
@@ -221,11 +308,40 @@ impl SelectionState {
         }
     }
 
+    pub(crate) fn selected(&self) -> impl Iterator<Item = usize> + '_ {
+        self.selected.iter().copied()
+    }
+
+    pub(crate) fn deselect(&mut self, image_ids: impl IntoIterator<Item = usize>) {
+        for image_id in image_ids {
+            self.selected.remove(&image_id);
+        }
+    }
+
+    /// Clears the selection, returning whether anything was selected.
+    pub(crate) fn clear(&mut self) -> bool {
+        let had_any = !self.is_empty();
+        self.selected.clear();
+        self.folders.clear();
+        had_any
+    }
+
     /// A press on empty world clears the selection unless Shift extends it.
     fn press_empty(&mut self, extend: bool) {
         if !extend {
             self.selected.clear();
+            self.folders.clear();
         }
+    }
+
+    /// A press is held: a drag may still be changing the arrangement.
+    pub(crate) fn pressing(&self) -> bool {
+        self.press.is_some()
+    }
+
+    /// Something selected has moved during the press still held.
+    fn moved_this_press(&self) -> bool {
+        self.press.as_ref().is_some_and(|press| press.moved_any)
     }
 
     /// A free left-drag of the selection is currently live; the scroll wheel
@@ -234,7 +350,85 @@ impl SelectionState {
     pub fn drag_active(&self) -> bool {
         self.press
             .as_ref()
-            .is_some_and(|press| matches!(press.kind, PressKind::Billboard { dragging: true, .. }))
+            .is_some_and(|press| matches!(press.kind, PressKind::Item { dragging: true, .. }))
+    }
+
+    /// What a drag of the selection moves: the selected folders that show
+    /// and are not inside another selected folder, and the selected images
+    /// not inside any of those. Everything else selected moves with its
+    /// folder.
+    fn moving(&self, folders: &FolderScene) -> MovingSelection {
+        let selected: Vec<usize> = self
+            .folders
+            .iter()
+            .filter_map(|key| folders.index_of(key))
+            .filter(|&index| folders.folders[index].visible)
+            .collect();
+        let outermost: Vec<usize> = selected
+            .iter()
+            .copied()
+            .filter(|&index| {
+                !selected
+                    .iter()
+                    .any(|&other| other != index && folders.is_within(index, other))
+            })
+            .collect();
+        let images = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|&image_id| {
+                !outermost
+                    .iter()
+                    .any(|&folder| folders.image_within(image_id, folder))
+            })
+            .collect();
+        MovingSelection {
+            images,
+            folders: outermost,
+        }
+    }
+}
+
+/// What a drag of the selection moves; see [`SelectionState::moving`].
+struct MovingSelection {
+    images: HashSet<usize>,
+    /// Indices into the scene's folders.
+    folders: Vec<usize>,
+}
+
+/// The camera a dragged billboard is re-faced toward.
+struct DragPose {
+    camera_position: Vec3,
+    viewport_normal: Vec3,
+    camera_up: Vec3,
+    facing_axis: BillboardFacingAxis,
+}
+
+impl DragPose {
+    fn of(camera: &Transform, facing_axis: BillboardFacingAxis) -> Self {
+        Self {
+            camera_position: camera.translation,
+            viewport_normal: camera.rotation.mul_vec3(Vec3::Z),
+            camera_up: camera.rotation.mul_vec3(Vec3::Y),
+            facing_axis,
+        }
+    }
+
+    /// Puts a billboard at `position`, facing the camera: the facing
+    /// system skips work while the camera holds still, so a moved billboard
+    /// has to be re-faced here.
+    fn place(&self, transform: &mut Transform, position: Vec3) {
+        transform.translation = position;
+        let to_camera = self.camera_position - position;
+        if to_camera.length_squared() > f32::EPSILON {
+            transform.rotation = billboard_rotation(
+                to_camera.normalize(),
+                self.viewport_normal,
+                self.camera_up,
+                self.facing_axis,
+            );
+        }
     }
 }
 
@@ -339,7 +533,16 @@ pub struct SelectionDragStores<'w> {
     cloud: ResMut<'w, PointCloud>,
     navigation_targets: ResMut<'w, NavigationTargets>,
     catalog_load_task: ResMut<'w, CatalogLoadTask>,
+    folder_view: ResMut<'w, FolderViewState>,
 }
+
+/// Every folder cube, which a dragged folder carries along directly.
+type FolderShellQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Transform, &'static mut FolderShell),
+    (Without<MediaBillboard>, Without<FlyCamera>),
+>;
 
 /// Bundled so `handle_selection_and_drag` stays within Bevy's supported
 /// system-function parameter arity.
@@ -367,7 +570,34 @@ pub struct SelectionDragQueries<'w, 's> {
     >,
     billboard_transforms:
         Query<'w, 's, (&'static MediaBillboard, &'static mut Transform), Without<FlyCamera>>,
+    shells: FolderShellQuery<'w, 's>,
     video_strips: VideoStripHitQuery<'w, 's>,
+}
+
+/// Selects every picture the scene shows full size and every closed folder
+/// that shows, when the select-all key is pressed outside a menu and a drag.
+pub(crate) fn select_everything_shown(
+    input: ControlInput,
+    pause_menu: Res<PauseMenuState>,
+    scene: Res<ExplorerScene>,
+    mut selection: ResMut<SelectionState>,
+) {
+    if pause_menu.paused || selection.pressing() || !input.just_pressed(Action::SelectAll) {
+        return;
+    }
+    selection.select_only(
+        scene
+            .image_points
+            .iter()
+            .filter(|point| point.scale >= 1.0)
+            .map(|point| point.image_id),
+        scene
+            .folders
+            .folders
+            .iter()
+            .filter(|folder| folder.visible && !folder.open)
+            .map(|folder| folder.key.clone()),
+    );
 }
 
 /// Left-click selection and drag-to-move. A press over a billboard selects
@@ -383,8 +613,7 @@ pub struct SelectionDragQueries<'w, 's> {
 #[allow(clippy::too_many_arguments)]
 pub fn handle_selection_and_drag(
     real_time: Res<Time<Real>>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
+    input: ControlInput,
     mut mouse_motion: EventReader<MouseMotion>,
     mut mouse_wheel: EventReader<MouseWheel>,
     pause_menu: Res<PauseMenuState>,
@@ -393,6 +622,8 @@ pub fn handle_selection_and_drag(
     facing: Res<BillboardFacingSettings>,
     billboard_controls: Res<BillboardControls>,
     gizmo: Res<TranslateGizmo>,
+    handles: Res<FolderHandles>,
+    mut selection_box: ResMut<SelectionBox>,
     mut selection: ResMut<SelectionState>,
     mut stores: SelectionDragStores,
     mut queries: SelectionDragQueries,
@@ -402,18 +633,31 @@ pub fn handle_selection_and_drag(
         mouse_motion.clear();
         mouse_wheel.clear();
         selection.press = None;
+        selection_box.rect = None;
         return;
     }
 
     // Release first: a click settles the selection (see `ClickRelease`),
     // a finished free drag optionally snaps the dropped items to the
-    // image-size grid, and any move publishes the new positions to the
+    // layout grid, and any move publishes the new positions to the
     // teleport targets. An axis drag already stepped on the grid live.
-    if !mouse_buttons.pressed(MouseButton::Left) {
+    if !input.pressed(Action::Select) {
         if let Some(press) = selection.press.take() {
-            if let PressKind::Billboard {
-                image_id,
-                release,
+            if let PressKind::Box {
+                extend, dragging, ..
+            } = press.kind
+            {
+                selection_box.rect = None;
+                if !dragging {
+                    selection.press_empty(extend);
+                }
+                mouse_motion.clear();
+                return;
+            }
+            let moving = selection.moving(&stores.scene.folders);
+            let snap = billboard_controls.snap_to_grid;
+            if let PressKind::Item {
+                grabbed,
                 pressed_at_seconds,
                 dragging,
                 ..
@@ -421,15 +665,54 @@ pub fn handle_selection_and_drag(
             {
                 let held = real_time.elapsed_secs() - pressed_at_seconds >= CLICK_HOLD_SECONDS;
                 if !dragging && !held {
-                    selection.release_click(image_id, release);
+                    match grabbed {
+                        Grabbed::Billboard { image_id, release } => {
+                            selection.release_click(image_id, release);
+                        }
+                        Grabbed::Folder {
+                            key,
+                            click_toggles: true,
+                        } => {
+                            stores.folder_view.toggle(&key, real_time.elapsed_secs());
+                        }
+                        Grabbed::Folder { .. } => {}
+                    }
                 }
-                if press.moved_any && billboard_controls.snap_to_grid {
-                    snap_selection_to_grid(selection, &mut stores, &mut queries, facing.axis);
+                if press.moved_any && snap {
+                    snap_images_to_grid(&moving.images, &mut stores, &mut queries, facing.axis);
                 }
             }
             if press.moved_any {
                 stores.navigation_targets.replace_positions(
                     stores.scene.image_points.iter().map(|point| point.position),
+                );
+                let cell = Vec3::splat(stores.scene.billboard_world_size);
+                let images: Vec<(usize, Vec3)> = moving
+                    .images
+                    .iter()
+                    .filter_map(|&image_id| {
+                        Some((image_id, stores.loading.loaded_point(image_id)?.position))
+                    })
+                    .collect();
+                let folders: Vec<(usize, Vec3)> = moving
+                    .folders
+                    .iter()
+                    .map(|&index| {
+                        let home = stores.scene.folders.folders[index].home;
+                        let dropped_at = if snap {
+                            snap_position_to_grid(home, cell)
+                        } else {
+                            home
+                        };
+                        (index, dropped_at)
+                    })
+                    .collect();
+                settle_drops(
+                    images,
+                    folders,
+                    &stores.scene,
+                    &mut stores.catalog_load_task.arrangement(),
+                    &mut stores.folder_view,
                 );
             }
         }
@@ -437,7 +720,7 @@ pub fn handle_selection_and_drag(
         return;
     }
 
-    if mouse_buttons.just_pressed(MouseButton::Left) {
+    if input.just_pressed(Action::Select) {
         mouse_motion.clear();
         // A click the UI owns or a click inside the axis gizmo canvas must
         // neither select nor clear.
@@ -462,7 +745,7 @@ pub fn handle_selection_and_drag(
         // so its arrows win the press over strips and billboards alike.
         // Hit-tested with the same (lagged) camera pose the gizmo was
         // rendered with.
-        if !selection.selected.is_empty() {
+        if !selection.is_empty() {
             if let Some(axis_index) = gizmo.axis_under_ray(ray_origin, ray_direction) {
                 let Some(cursor_position) = cursor_render_position(window, &render_resolution)
                 else {
@@ -500,42 +783,127 @@ pub fn handle_selection_and_drag(
         {
             return;
         }
-        let extend = keyboard.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-        match billboard_hit.map(|hit| hit.image_id) {
-            Some(image_id) => {
-                // The drag anchor lives in the fresh camera pose so the
-                // first drag frame starts without the propagation lag.
-                let Some((_, anchor_direction)) = cursor_world_ray(
-                    window,
-                    camera,
-                    &GlobalTransform::from(*camera_transform),
-                    &render_resolution,
-                ) else {
+        let extend = input.pressed(Action::AddToSelection);
+        // A folder's handle in front of every picture stands in for the
+        // folder, or closes it.
+        let handle = handles
+            .hit(ray_origin, ray_direction)
+            .filter(|handle| billboard_hit.is_none_or(|hit| handle.distance < hit.distance));
+        if let Some(FolderHandleHit {
+            key,
+            kind: FolderHandleKind::Close,
+            ..
+        }) = &handle
+        {
+            if !extend {
+                stores.folder_view.toggle(key, real_time.elapsed_secs());
+                return;
+            }
+        }
+        let on_tag = handle
+            .as_ref()
+            .is_some_and(|handle| handle.kind == FolderHandleKind::Label);
+        let pressed_folder = match handle {
+            Some(handle) => Some(handle.key),
+            None => stores
+                .scene
+                .folders
+                .pressed_folder(
+                    ray_origin,
+                    ray_direction,
+                    billboard_hit.map(|hit| (hit.image_id, hit.distance)),
+                )
+                .cloned(),
+        };
+        let grabbed = match (pressed_folder, billboard_hit) {
+            (Some(folder), _) if extend => {
+                selection.toggle_folder(folder);
+                return;
+            }
+            // A tag selects its folder, ready to drag, and never opens it.
+            (Some(folder), _) if on_tag => {
+                if !selection.is_folder_selected(&folder) {
+                    selection.select_only_folder(folder.clone());
+                }
+                Grabbed::Folder {
+                    key: folder,
+                    click_toggles: false,
+                }
+            }
+            (Some(folder), _) if selection.is_folder_selected(&folder) => Grabbed::Folder {
+                key: folder,
+                click_toggles: true,
+            },
+            (Some(folder), _) => {
+                stores.folder_view.toggle(&folder, real_time.elapsed_secs());
+                return;
+            }
+            (None, Some(hit)) => Grabbed::Billboard {
+                image_id: hit.image_id,
+                release: selection.press_billboard(hit.image_id, extend),
+            },
+            (None, None) => {
+                let Some(start) = window.cursor_position() else {
                     return;
                 };
-                let release = selection.press_billboard(image_id, extend);
                 selection.press = Some(PressState {
-                    kind: PressKind::Billboard {
-                        image_id,
-                        release,
-                        pressed_at_seconds: real_time.elapsed_secs(),
+                    kind: PressKind::Box {
+                        start,
+                        extend,
+                        before_images: selection.selected.clone(),
+                        before_folders: selection.folders.clone(),
                         accumulated_motion: 0.0,
                         dragging: false,
-                        drag_anchor_direction: anchor_direction,
-                        last_cursor_direction: anchor_direction,
-                        last_camera_position: camera_transform.translation,
                     },
                     moved_any: false,
                 });
+                return;
             }
-            None => selection.press_empty(extend),
-        }
+        };
+        // The drag anchor lives in the fresh camera pose so the
+        // first drag frame starts without the propagation lag.
+        let Some((_, anchor_direction)) = cursor_world_ray(
+            window,
+            camera,
+            &GlobalTransform::from(*camera_transform),
+            &render_resolution,
+        ) else {
+            return;
+        };
+        selection.press = Some(PressState {
+            kind: PressKind::Item {
+                grabbed,
+                pressed_at_seconds: real_time.elapsed_secs(),
+                accumulated_motion: 0.0,
+                dragging: false,
+                drag_anchor_direction: anchor_direction,
+                last_cursor_direction: anchor_direction,
+                last_camera_position: camera_transform.translation,
+            },
+            moved_any: false,
+        });
         return;
     }
 
-    let Some(press) = selection.press.as_mut() else {
+    if selection.press.is_none() {
         mouse_motion.clear();
         mouse_wheel.clear();
+        return;
+    }
+    if let Some(PressState {
+        kind: PressKind::Box { .. },
+        ..
+    }) = selection.press
+    {
+        let motion: f32 = mouse_motion
+            .read()
+            .map(|motion| motion.delta.length())
+            .sum();
+        box_select(selection, motion, &stores, &queries, &mut selection_box);
+        return;
+    }
+    let moving = selection.moving(&stores.scene.folders);
+    let Some(press) = selection.press.as_mut() else {
         return;
     };
     let Ok((camera, _, camera_transform)) = queries.camera.get_single() else {
@@ -543,11 +911,10 @@ pub fn handle_selection_and_drag(
     };
     let camera_position = camera_transform.translation;
     let fresh_camera_pose = GlobalTransform::from(*camera_transform);
-    let camera_up = camera_transform.rotation.mul_vec3(Vec3::Y);
-    let viewport_normal = camera_transform.rotation.mul_vec3(Vec3::Z);
+    let pose = DragPose::of(camera_transform, facing.axis);
 
     match &mut press.kind {
-        PressKind::Billboard {
+        PressKind::Item {
             accumulated_motion,
             dragging,
             drag_anchor_direction,
@@ -568,7 +935,7 @@ pub fn handle_selection_and_drag(
                 }
                 *dragging = true;
             }
-            if selection.selected.is_empty() {
+            if moving.images.is_empty() && moving.folders.is_empty() {
                 return;
             }
 
@@ -618,16 +985,18 @@ pub fn handle_selection_and_drag(
             }
 
             let min_distance = stores.scene.billboard_world_size;
-            for (billboard, mut transform) in &mut queries.billboard_transforms {
-                if !selection.selected.contains(&billboard.image_id) {
-                    continue;
-                }
+            let dragged_to = |position: Vec3| {
                 // Adding `player_delta` first keeps the offset the item had
                 // relative to the camera before this frame's flight.
-                let carried_offset = transform.translation + player_delta - camera_position;
-                let offset =
-                    scale_offset_depth(rotation * carried_offset, distance_scale, min_distance);
-                let position = camera_position + offset;
+                let carried_offset = position + player_delta - camera_position;
+                camera_position
+                    + scale_offset_depth(rotation * carried_offset, distance_scale, min_distance)
+            };
+            for (billboard, mut transform) in &mut queries.billboard_transforms {
+                if !moving.images.contains(&billboard.image_id) {
+                    continue;
+                }
+                let position = dragged_to(transform.translation);
                 if position.distance_squared(transform.translation) <= f32::EPSILON {
                     continue;
                 }
@@ -635,15 +1004,24 @@ pub fn handle_selection_and_drag(
                     &mut transform,
                     billboard.image_id,
                     position,
-                    camera_position,
-                    viewport_normal,
-                    camera_up,
-                    facing.axis,
+                    &pose,
                     &mut stores,
                 );
                 press.moved_any = true;
             }
+            for &folder in &moving.folders {
+                let home = stores.scene.folders.folders[folder].home;
+                shift_folder(
+                    folder,
+                    dragged_to(home) - home,
+                    &pose,
+                    &mut stores,
+                    &mut queries,
+                );
+                press.moved_any = true;
+            }
         }
+        PressKind::Box { .. } => {}
         PressKind::GizmoAxis {
             axis_index,
             origin,
@@ -652,7 +1030,7 @@ pub fn handle_selection_and_drag(
             applied_offset,
         } => {
             mouse_motion.clear();
-            if selection.selected.is_empty() {
+            if moving.images.is_empty() && moving.folders.is_empty() {
                 return;
             }
             let Some(cursor_position) = queries
@@ -692,7 +1070,7 @@ pub fn handle_selection_and_drag(
             let delta = axis * step;
 
             for (billboard, mut transform) in &mut queries.billboard_transforms {
-                if !selection.selected.contains(&billboard.image_id) {
+                if !moving.images.contains(&billboard.image_id) {
                     continue;
                 }
                 let position = transform.translation + delta;
@@ -700,50 +1078,162 @@ pub fn handle_selection_and_drag(
                     &mut transform,
                     billboard.image_id,
                     position,
-                    camera_position,
-                    viewport_normal,
-                    camera_up,
-                    facing.axis,
+                    &pose,
                     &mut stores,
                 );
+                press.moved_any = true;
+            }
+            for &folder in &moving.folders {
+                shift_folder(folder, delta, &pose, &mut stores, &mut queries);
                 press.moved_any = true;
             }
         }
     }
 }
 
+/// Marks the folders the selection would drop into were the press
+/// released now.
+pub(crate) fn update_drop_targets(
+    selection: Res<SelectionState>,
+    scene: Res<ExplorerScene>,
+    loading: Res<ImageLoadingState>,
+    mut drop_targets: ResMut<DropTargets>,
+) {
+    let targets: HashSet<FolderKey> = if selection.moved_this_press() {
+        let moving = selection.moving(&scene.folders);
+        let folders = &scene.folders;
+        let images = moving.images.iter().filter_map(|&image_id| {
+            let position = loading.loaded_point(image_id)?.position;
+            folders.image_drop_target(image_id, position)
+        });
+        let nested = moving
+            .folders
+            .iter()
+            .filter_map(|&index| folders.folder_drop_target(index, folders.folders[index].home));
+        images.chain(nested).cloned().collect()
+    } else {
+        HashSet::new()
+    };
+    if drop_targets.0 != targets {
+        drop_targets.0 = targets;
+    }
+}
+
+/// Grows a box press into a box selection once it has moved far enough,
+/// and selects what the box holds: every full-size picture and closed
+/// folder whose center it covers, and every open folder it covers whole.
+fn box_select(
+    selection: &mut SelectionState,
+    motion: f32,
+    stores: &SelectionDragStores,
+    queries: &SelectionDragQueries,
+    selection_box: &mut SelectionBox,
+) {
+    let Some(PressState {
+        kind:
+            PressKind::Box {
+                start,
+                extend,
+                before_images,
+                before_folders,
+                accumulated_motion,
+                dragging,
+            },
+        ..
+    }) = selection.press.as_mut()
+    else {
+        return;
+    };
+    if !*dragging {
+        *accumulated_motion += motion;
+        if *accumulated_motion < SELECTION_DRAG_MOTION_THRESHOLD {
+            return;
+        }
+        *dragging = true;
+    }
+    let (Ok(window), Ok((camera, camera_pose, _))) =
+        (queries.window.get_single(), queries.camera.get_single())
+    else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let rect = Rect::from_corners(*start, cursor);
+    selection_box.rect = Some(rect);
+    let Some(viewport_size) = camera.logical_viewport_size() else {
+        return;
+    };
+    // The scene renders to an offscreen target stretched over the window.
+    let viewport_per_window = viewport_size / Vec2::new(window.width(), window.height());
+    let covers = |point: Vec3| {
+        camera
+            .world_to_viewport(camera_pose, point)
+            .is_ok_and(|viewport| rect.contains(viewport / viewport_per_window))
+    };
+    let (mut images, mut folders) = if *extend {
+        (before_images.clone(), before_folders.clone())
+    } else {
+        (HashSet::new(), HashSet::new())
+    };
+    for (billboard, transform, visibility) in &queries.billboards {
+        let full_size = stores
+            .loading
+            .loaded_point(billboard.image_id)
+            .is_some_and(|point| point.scale >= 1.0);
+        if *visibility != Visibility::Hidden && full_size && covers(transform.translation()) {
+            images.insert(billboard.image_id);
+        }
+    }
+    for folder in stores
+        .scene
+        .folders
+        .folders
+        .iter()
+        .filter(|folder| folder.visible)
+    {
+        let covered = if folder.open {
+            (0..8).all(|corner| {
+                let sign = Vec3::new(
+                    if corner & 1 == 0 { -1.0 } else { 1.0 },
+                    if corner & 2 == 0 { -1.0 } else { 1.0 },
+                    if corner & 4 == 0 { -1.0 } else { 1.0 },
+                );
+                covers(folder.center + folder.size * 0.5 * sign)
+            })
+        } else {
+            covers(folder.center)
+        };
+        if covered {
+            folders.insert(folder.key.clone());
+        }
+    }
+    selection.selected = images;
+    selection.folders = folders;
+}
+
 /// Writes a manually placed position into the billboard entity and every
-/// flat store that mirrors it, re-facing the billboard toward the camera
-/// (the facing system skips work while the camera holds still, so a moved
-/// billboard has to be re-faced here).
-#[allow(clippy::too_many_arguments)]
+/// flat store that mirrors it, and remembers the image as out of every
+/// folder until it is dropped.
 fn place_item(
     transform: &mut Transform,
     image_id: usize,
     position: Vec3,
-    camera_position: Vec3,
-    viewport_normal: Vec3,
-    camera_up: Vec3,
-    facing_axis: BillboardFacingAxis,
+    pose: &DragPose,
     stores: &mut SelectionDragStores,
 ) {
-    transform.translation = position;
-    let to_camera = camera_position - position;
-    if to_camera.length_squared() > f32::EPSILON {
-        transform.rotation = billboard_rotation(
-            to_camera.normalize(),
-            viewport_normal,
-            camera_up,
-            facing_axis,
-        );
-    }
-
-    stores.loading.update_loaded_position(image_id, position);
-    stores.cloud.set_point_position(image_id, position);
+    pose.place(transform, position);
+    move_point(image_id, position, stores);
     stores
         .catalog_load_task
-        .dragged_positions
-        .insert(image_id, position);
+        .arrangement()
+        .place(image_id, ManualPlacement::Loose(position));
+}
+
+/// Writes an image's new position into every flat store that mirrors it.
+fn move_point(image_id: usize, position: Vec3, stores: &mut SelectionDragStores) {
+    stores.loading.update_loaded_position(image_id, position);
+    stores.cloud.set_point_position(image_id, position);
     if let Some(point_index) = stores.index.get(image_id) {
         if let Some(point) = stores.scene.image_points.get_mut(point_index) {
             if point.image_id == image_id {
@@ -753,12 +1243,56 @@ fn place_item(
     }
 }
 
-/// Snaps every selected billboard onto the nearest point of the image-size
-/// grid when a free drag is released with "Snap drag to grid" enabled. The
-/// cell is the billboard's world size — the displayed image square — so any
-/// two separately dropped items land exactly flush against one another.
-fn snap_selection_to_grid(
-    selection: &SelectionState,
+/// Moves a folder by `delta` with everything in it: the folders nested in
+/// it, their cubes, and every image of theirs the scene shows. The images
+/// stay in their folders, so their placements are left alone.
+fn shift_folder(
+    index: usize,
+    delta: Vec3,
+    pose: &DragPose,
+    stores: &mut SelectionDragStores,
+    queries: &mut SelectionDragQueries,
+) {
+    if delta == Vec3::ZERO {
+        return;
+    }
+    for image_id in stores.scene.folders.shift_subtree(index, delta) {
+        let Some(point) = stores.loading.loaded_point(image_id).or_else(|| {
+            let point_index = stores.index.get(image_id)?;
+            stores
+                .scene
+                .image_points
+                .get(point_index)
+                .filter(|point| point.image_id == image_id)
+        }) else {
+            // Hidden in a closed folder: nothing shows to move.
+            continue;
+        };
+        let position = point.position + delta;
+        if let Some(entity) = stores.loading.loaded_entity(image_id) {
+            if let Ok((_, mut transform)) = queries.billboard_transforms.get_mut(entity) {
+                pose.place(&mut transform, position);
+            }
+        }
+        move_point(image_id, position, stores);
+    }
+    let folders = &stores.scene.folders;
+    for (mut transform, mut shell) in &mut queries.shells {
+        let Some(folder) = folders.index_of(shell.key()) else {
+            continue;
+        };
+        if folders.is_within(folder, index) {
+            shell.place_at(&mut transform, folders.folders[folder].center);
+        }
+    }
+}
+
+/// Snaps the dropped billboards onto the nearest point of the layout grid
+/// when a free drag is released with "Snap drag to grid" enabled. A cell is
+/// one cube, so any two separately dropped items sit flush, exactly as far
+/// apart as neighbours in the layout.
+fn snap_images_to_grid(
+    images: &HashSet<usize>,
     stores: &mut SelectionDragStores,
     queries: &mut SelectionDragQueries,
     facing_axis: BillboardFacingAxis,
@@ -766,44 +1300,33 @@ fn snap_selection_to_grid(
     let Ok((_, _, camera_transform)) = queries.camera.get_single() else {
         return;
     };
-    let camera_position = camera_transform.translation;
-    let camera_up = camera_transform.rotation.mul_vec3(Vec3::Y);
-    let viewport_normal = camera_transform.rotation.mul_vec3(Vec3::Z);
-    let spacing = stores.scene.billboard_world_size;
+    let pose = DragPose::of(camera_transform, facing_axis);
+    let cell = Vec3::splat(stores.scene.billboard_world_size);
 
     for (billboard, mut transform) in &mut queries.billboard_transforms {
-        if !selection.selected.contains(&billboard.image_id) {
+        if !images.contains(&billboard.image_id) {
             continue;
         }
-        let snapped = snap_position_to_grid(transform.translation, spacing);
+        let snapped = snap_position_to_grid(transform.translation, cell);
         if snapped == transform.translation {
             continue;
         }
-        place_item(
-            &mut transform,
-            billboard.image_id,
-            snapped,
-            camera_position,
-            viewport_normal,
-            camera_up,
-            facing_axis,
-            stores,
-        );
+        place_item(&mut transform, billboard.image_id, snapped, &pose, stores);
     }
 }
 
-/// Nearest lattice point of the `spacing`-sized coordinate grid.
-fn snap_position_to_grid(position: Vec3, spacing: f32) -> Vec3 {
-    if spacing <= f32::EPSILON {
+/// Nearest lattice point of the grid with a `cell`-sized cell per axis.
+fn snap_position_to_grid(position: Vec3, cell: Vec3) -> Vec3 {
+    if cell.min_element() <= f32::EPSILON {
         return position;
     }
-    (position / spacing).round() * spacing
+    (position / cell).round() * cell
 }
 
 /// Target offset of a gizmo axis drag: the raw cursor-derived offset or,
 /// with grid snapping, the offset that lands the gizmo origin's coordinate
-/// on the image-size grid — so an item stepped along an axis sits flush
-/// against any other grid-placed item.
+/// on the layout grid — so an item stepped along an axis sits exactly one
+/// layout neighbour away from any other grid-placed item.
 fn axis_drag_offset(raw_offset: f32, origin_coordinate: f32, snap_cell: Option<f32>) -> f32 {
     match snap_cell {
         Some(cell) if cell > f32::EPSILON => {
@@ -910,6 +1433,7 @@ type GizmoOverlayCameraQuery<'w, 's> = Query<
 pub fn sync_translate_gizmo(
     mut commands: Commands,
     selection: Res<SelectionState>,
+    scene: Res<ExplorerScene>,
     mut gizmo: ResMut<TranslateGizmo>,
     render_target: Res<SceneRenderTarget>,
     camera_query: GizmoCameraQuery,
@@ -927,6 +1451,12 @@ pub fn sync_translate_gizmo(
                 centroid_sum += transform.translation;
                 selected_count += 1;
             }
+        }
+    }
+    for folder in &selection.folders {
+        if let Some(folder) = scene.folders.get(folder).filter(|folder| folder.visible) {
+            centroid_sum += folder.center;
+            selected_count += 1;
         }
     }
     if selected_count == 0 {
@@ -1322,7 +1852,7 @@ mod tests {
     fn selection_of(ids: &[usize]) -> SelectionState {
         SelectionState {
             selected: ids.iter().copied().collect(),
-            press: None,
+            ..default()
         }
     }
 
@@ -1442,9 +1972,9 @@ mod tests {
     }
 
     #[test]
-    fn axis_drag_offset_steps_onto_image_size_grid() {
-        // An item on the 6.0 coordinate lattice dragged toward a neighbor at
-        // the origin lands at exactly one image width (4.68): flush.
+    fn axis_drag_offset_steps_onto_layout_grid() {
+        // An item at 6.0 dragged toward a neighbor at the origin lands
+        // exactly one layout cell (4.68) away from it.
         let offset = axis_drag_offset(-0.9, 6.0, Some(4.68));
         assert!((6.0 + offset - 4.68).abs() < 0.0001);
 
@@ -1475,16 +2005,20 @@ mod tests {
     #[test]
     fn snap_position_to_grid_rounds_to_nearest_lattice_point() {
         assert_eq!(
-            snap_position_to_grid(Vec3::new(7.1, -4.0, 0.4), 6.0),
+            snap_position_to_grid(Vec3::new(7.1, -4.0, 0.4), Vec3::splat(6.0)),
             Vec3::new(6.0, -6.0, 0.0)
         );
+        // Each axis snaps to its own cell.
         assert_eq!(
-            snap_position_to_grid(Vec3::new(9.1, 3.1, -9.1), 6.0),
-            Vec3::new(12.0, 6.0, -12.0)
+            snap_position_to_grid(Vec3::new(9.1, 3.1, -9.1), Vec3::new(6.0, 2.0, 4.0)),
+            Vec3::new(12.0, 4.0, -8.0)
         );
-        // Degenerate spacing leaves positions untouched.
+        // A degenerate cell leaves positions untouched.
         let position = Vec3::new(1.2, 3.4, 5.6);
-        assert_eq!(snap_position_to_grid(position, 0.0), position);
+        assert_eq!(
+            snap_position_to_grid(position, Vec3::new(1.0, 0.0, 1.0)),
+            position
+        );
     }
 
     #[test]
@@ -1510,6 +2044,7 @@ mod tests {
                 image_id: 42,
                 path: "".into(),
                 position: Vec3::ZERO,
+                scale: 1.0,
                 is_video: false,
                 duration_seconds: None,
                 source_size: None,
@@ -1519,6 +2054,7 @@ mod tests {
                 image_id: 7,
                 path: "".into(),
                 position: Vec3::ONE,
+                scale: 1.0,
                 is_video: false,
                 duration_seconds: None,
                 source_size: None,

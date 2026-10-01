@@ -16,27 +16,40 @@ use bevy::render::{
 use bevy::sprite::AlphaMode2d;
 use bevy::window::{CursorGrabMode, PrimaryWindow, WindowResizeConstraints};
 use spatial_api::{ProjectionPage, ProjectionRequest, SpatialApiClient};
-use spatial_geometry::{estimate_smallest_axis_gap, median_position, projection_bounds, Bounds3};
+use spatial_geometry::{bounds_of, estimate_smallest_axis_gap, median_position, Bounds3};
 use spatial_viewer_ui::{
-    collect_performance_metrics, handle_audio_buttons, handle_billboard_buttons,
-    handle_control_buttons, handle_control_dropdown_scroll, handle_control_keyboard,
-    handle_debug_buttons, handle_navigation_buttons, handle_pause_menu_buttons,
-    handle_performance_buttons, handle_resolution_buttons, handle_start_menu_buttons,
-    navigation_status, rebuild_control_widgets, spawn_viewer_ui, update_audio_text,
+    apply_search_typing, capture_binding, collect_performance_metrics, handle_animation_buttons,
+    handle_audio_buttons, handle_billboard_buttons, handle_control_buttons,
+    handle_control_dropdown_scroll, handle_control_keyboard, handle_controls_sheet_buttons,
+    handle_debug_buttons, handle_edit_buttons, handle_folder_buttons, handle_navigation_buttons,
+    handle_pause_menu_buttons, handle_performance_buttons, handle_resolution_buttons,
+    handle_search_buttons, handle_start_menu_buttons, handle_text_entry_keyboard,
+    navigation_status, rebuild_control_widgets, scroll_controls_sheet, spawn_look_crosshair,
+    spawn_selection_box, spawn_viewer_ui, toggle_hud, update_animation_button_colors,
+    update_animation_panels, update_animation_text, update_audio_text,
     update_billboard_button_colors, update_billboard_panels, update_billboard_text,
-    update_control_button_colors, update_control_panels, update_control_text,
-    update_debug_button_colors, update_debug_panels, update_debug_text,
+    update_control_button_colors, update_control_input_state, update_control_panels,
+    update_control_text, update_controls_sheet, update_controls_sheet_colors,
+    update_debug_button_colors, update_debug_panels, update_debug_text, update_edit_button_colors,
+    update_folder_button_colors, update_folder_panels, update_folder_text, update_hud_panels,
     update_navigation_button_colors, update_navigation_panels, update_navigation_text,
     update_pause_button_colors, update_pause_panels, update_perf_graph_bars,
     update_performance_button_colors, update_performance_panels, update_performance_text,
-    update_resolution_button_colors, update_resolution_text, update_start_button_colors,
-    update_start_panels, update_start_text, update_ui_input_capture, AudioSettings, AxisGizmoState,
+    update_rename_prompt, update_resolution_button_colors, update_resolution_text,
+    update_search_button_colors, update_search_panels, update_search_text, update_selection_box,
+    update_start_button_colors, update_start_panels, update_start_text, update_typing_focus,
+    update_ui_input_capture, Action, AnimationSettings, AudioSettings, AxisGizmoState,
     BenchmarkControls, BillboardControls, BillboardFacingAxis, BillboardFacingSettings,
-    BillboardStats, ContextMenuPlugin, ContextMenuSystems, ControlPanelState, DebugSettings,
-    NavigationRequest, NavigationSettings, NavigationTargets, PauseMenuState, PerformanceMetrics,
-    PlaybackSettings, RenderResolutionSettings, StartMenuState, UiInputCapture,
+    BillboardStats, BindingEditor, ContextMenuPlugin, ContextMenuSystems, ControlInput,
+    ControlInputState, ControlPanelState, ControlsSheetState, DebugSettings, EditControls,
+    FolderControls, HudVisibility, LookCrosshair, NavigationRequest, NavigationSettings,
+    NavigationTargets, PauseMenuState, PerformanceMetrics, PlaybackSettings,
+    RenderResolutionSettings, SearchControls, SelectionBox, StartMenuState, TextEntry, TypingFocus,
+    UiInputCapture, ViewSettings,
 };
 
+mod arrangement_history;
+mod arrangement_store;
 mod audio_stream;
 mod axis_gizmo;
 mod background_work;
@@ -45,8 +58,12 @@ mod billboard_menu;
 mod catalog_load;
 mod catalog_session;
 mod cli;
+mod controls_store;
 mod decode_budget;
 mod ffmpeg_pipe;
+mod fit_view;
+mod folder_labels;
+mod folders;
 mod image_loading;
 mod load_sampling;
 mod manual_spacing;
@@ -56,11 +73,16 @@ mod media_settings;
 use media_decode::{BillboardTextureEncoding, BillboardTextureFormat};
 mod performance;
 mod point_cloud;
+mod search;
 mod video_controls;
 mod video_stream;
 mod video_strip;
 mod video_strip_layout;
 
+use arrangement_history::{apply_edit_requests, ArrangementHistory};
+use arrangement_store::{
+    keep_arrangements, keep_arrangements_on_exit, remember_camera_pose, ArrangementStore,
+};
 use audio_stream::AudioPlaybackState;
 use axis_gizmo::{
     axis_gizmo_generic_up_vector, axis_gizmo_up_vector, axis_gizmo_view_direction,
@@ -75,29 +97,42 @@ use billboard_menu::{
 };
 use catalog_load::{
     apply_control_submit_requests, handle_start_menu_requests, point_cloud_points,
-    poll_catalog_load_task, poll_folder_pick_task, projection_billboard_points,
-    restore_last_catalog, CatalogLoadTask, FolderPickTask, InitialPlayerPlacement,
-    LastPickedFolder, RestoredCatalogRoots,
+    poll_catalog_load_task, poll_folder_pick_task, reset_catalog_layout, restore_last_catalog,
+    CatalogLoadTask, FolderPickTask, InitialPlayerPlacement, LastPickedFolder,
+    RestoredCatalogRoots,
 };
 use catalog_session::load_last_catalog_roots;
 use cli::ViewerArgs;
+use controls_store::{keep_control_bindings, ControlsStore};
 use decode_budget::DecodeBudget;
+use fit_view::{fit_selection_to_view, fly_camera_to_fit, CameraFlight};
+use folder_labels::{place_folder_handles, sync_folder_labels, FolderHandleAssets, FolderHandles};
+use folders::{
+    animate_billboards, animate_folder_shells, animate_retiring_billboards, apply_folder_changes,
+    apply_folder_commands, apply_folder_rename, apply_folder_requests, launch_revealed_images,
+    record_arrangement_history, release_withheld_placeholders, sync_folder_shells,
+    update_billboard_hover, withhold_revealed_placeholders, BillboardHover, DropTargets,
+    FolderCommand, FolderRename, FolderScene, FolderShellAssets, FolderViewState,
+    FolderWallMaterial, FolderWallPlugin, WithheldPlaceholders,
+};
 use image_loading::{
-    billboard_rotation, billboard_world_size, create_billboard_mesh, face_billboards_to_camera,
+    billboard_rotation, create_billboard_mesh, face_billboards_to_camera,
     publish_image_loading_stats, receive_image_loads, schedule_image_loads,
     spawn_visible_coordinate_labels, update_billboard_coordinate_label_visibility,
     BillboardAxisLabels, BillboardLabelFont, BillboardPoint, BillboardWorldSize, ImageLoadingState,
     MediaBillboard, BILLBOARD_GPU_UPLOAD_BYTES_PER_FRAME,
 };
 use manual_spacing::{
-    handle_selection_and_drag, sync_selection_highlights, sync_translate_gizmo, ImagePointIndex,
-    SelectionHighlights, SelectionState, TranslateGizmo, TranslateGizmoCamera,
+    handle_selection_and_drag, select_everything_shown, sync_selection_highlights,
+    sync_translate_gizmo, update_drop_targets, ImagePointIndex, SelectionHighlights,
+    SelectionState, TranslateGizmo, TranslateGizmoCamera,
 };
 use media_probe::{receive_media_probes, MediaProbes};
 use media_settings::{save_media_settings, save_media_settings_on_exit, MediaSettings};
 use point_cloud::{
     apply_point_cloud_edits, spawn_boundary_walls, update_view_bounds, PointCloud, ViewBounds,
 };
+use search::{run_search, SearchState};
 use video_controls::{
     advance_video_clocks, apply_video_playback_frame, clear_stale_video_controls,
     handle_video_keyboard, release_slider_drag, remember_playback_positions,
@@ -109,6 +144,10 @@ use video_strip::{
     update_video_strip_labels, VideoControlsFont, VideoStripAssets,
 };
 
+/// World size of a billboard, and so of the layout cube it sits in. Every
+/// world-scale tuning (labels, video strips, navigation) is relative to it.
+const BILLBOARD_WORLD_SIZE: f32 = 4.68;
+
 #[derive(Resource)]
 struct ExplorerScene {
     projection: spatial_api::ProjectionPage,
@@ -116,11 +155,16 @@ struct ExplorerScene {
     image_points: Vec<BillboardPoint>,
     client: SpatialApiClient,
     projection_limit: usize,
-    coordinate_spacing: f32,
-    duplicate_spacing: f32,
+    /// The folders `image_points` were laid out with. The folder state may
+    /// already ask for another layout; see `apply_folder_changes`.
+    folders: FolderScene,
+    /// Bumped every time `folders` is replaced, so folder shells know to
+    /// resync.
+    folder_generation: u64,
     texture_budget_mib: u32,
     image_concurrency: usize,
     max_texture_side: u32,
+    /// World size of a billboard, and of the layout cube it sits in.
     billboard_world_size: f32,
     camera_speed: f32,
     navigation_reference_distance: f32,
@@ -130,15 +174,10 @@ struct ExplorerScene {
 }
 
 impl ExplorerScene {
-    /// A request carrying this scene's layout parameters. Callers add the
-    /// roots and control values.
+    /// A request for this scene's page size. Callers add the roots and
+    /// control values.
     fn projection_request(&self) -> ProjectionRequest {
-        ProjectionRequest::new(
-            self.coordinate_spacing,
-            self.duplicate_spacing,
-            self.billboard_world_size,
-            self.projection_limit,
-        )
+        ProjectionRequest::new(self.projection_limit)
     }
 }
 
@@ -213,18 +252,26 @@ fn media_decode_task_pool_options(decode_budget: usize) -> TaskPoolOptions {
 pub(crate) const PRESENTATION_RENDER_LAYER: usize = 2;
 
 /// Tracks a potential right-button look-drag so the cursor is hidden and
-/// pinned in place only once real drag motion happens — a plain right click
-/// never touches the cursor.
+/// pinned only once real drag motion happens — a plain right click never
+/// touches the cursor.
 #[derive(Resource, Default)]
-struct RightDragCursorState {
+pub(crate) struct RightDragCursorState {
     /// Cursor position (logical pixels) when the right button went down in
     /// the world; `None` while the button is up or the press began over UI.
     anchor: Option<Vec2>,
     /// Raw motion accumulated since the press, before the drag threshold.
     accumulated_motion: f32,
-    /// The threshold was crossed: the cursor is hidden and pinned to
-    /// `anchor` until release.
+    /// The threshold was crossed: the cursor is hidden and pinned to the
+    /// center of the view, under the look crosshair, until release.
     dragging: bool,
+}
+
+impl RightDragCursorState {
+    /// The view is being dragged around: the pointer holds still at the
+    /// center of the view while the scene sweeps under it.
+    pub(crate) fn look_dragging(&self) -> bool {
+        self.dragging
+    }
 }
 
 /// Frees a large value off the main thread; deallocating tens of thousands
@@ -254,8 +301,7 @@ type FlyCameraTransformQuery<'w, 's> =
 #[derive(SystemParam)]
 struct FlyCameraInput<'w, 's> {
     time: Res<'w, Time>,
-    keyboard: Res<'w, ButtonInput<KeyCode>>,
-    mouse_buttons: Res<'w, ButtonInput<MouseButton>>,
+    controls: ControlInput<'w>,
     mouse_motion: EventReader<'w, 's, MouseMotion>,
     mouse_wheel: EventReader<'w, 's, MouseWheel>,
 }
@@ -272,26 +318,24 @@ fn main() -> Result<()> {
         bail!("Viewer API returned non-ok status: {}", health.status);
     }
 
-    let image_world_size = billboard_world_size(args.spacing, args.billboard_scale);
     // No catalog is loaded at startup: the scene starts empty and the last
     // used roots (if any) are loaded through the start menu's background
     // task once the app is running, so the window appears immediately.
     let projection = ProjectionPage {
         axis_labels: [None, None, None],
-        coordinate_spacing: args.spacing,
-        duplicate_spacing: args.duplicates,
-        sprite_world_height: image_world_size,
         offset: 0,
         limit: args.limit,
         total: 0,
         points: Vec::new(),
     };
-    let bounds = projection_bounds(&projection.points);
-    let image_points = projection_billboard_points(&projection);
-    let nearest_gap = estimate_smallest_axis_gap(&projection.points).unwrap_or(args.spacing);
-    let camera_speed = navigation_speed(nearest_gap, args.spacing);
-    let navigation_reference_distance = args.spacing.max(image_world_size).max(1.0);
-    let initial_view_distance = initial_camera_distance(args.spacing, image_world_size);
+    let image_points: Vec<BillboardPoint> = Vec::new();
+    let bounds = bounds_of(image_points.iter().map(|point| point.position));
+    let cell = BILLBOARD_WORLD_SIZE;
+    let nearest_gap =
+        estimate_smallest_axis_gap(image_points.iter().map(|point| point.position)).unwrap_or(cell);
+    let camera_speed = navigation_speed(nearest_gap, cell);
+    let navigation_reference_distance = cell.max(BILLBOARD_WORLD_SIZE).max(1.0);
+    let initial_view_distance = initial_camera_distance(cell, BILLBOARD_WORLD_SIZE);
     let axis_labels = projection.axis_labels.clone().map(axis_label);
     let last_catalog_roots =
         if std::env::var_os("SPATIAL_VIEWER_PERF_CONFIG").is_some() {
@@ -321,7 +365,7 @@ fn main() -> Result<()> {
     };
     println!(
         "Media loading: {} MiB texture VRAM budget, {} local decode workers, {texture_side} resolution, billboard size {:.2}",
-        args.texture_budget_mib, args.image_concurrency, image_world_size
+        args.texture_budget_mib, args.image_concurrency, BILLBOARD_WORLD_SIZE
     );
 
     // Video playback streams on threads of its own (see `ffmpeg_pipe`), so
@@ -336,19 +380,34 @@ fn main() -> Result<()> {
     );
 
     let mut app = App::new();
+    let measuring = args.benchmark_seconds.is_some()
+        || std::env::var_os(performance::PERF_CONFIG_ENV).is_some();
+    // Benchmark and harness runs neither follow nor change the user's
+    // arrangements.
+    let arrangements = if measuring {
+        ArrangementStore::in_memory()
+    } else {
+        ArrangementStore::load()
+    };
+    // Nor the user's control bindings: the harness presses the default keys.
+    let (controls_store, control_bindings) = if measuring {
+        ControlsStore::in_memory()
+    } else {
+        ControlsStore::load()
+    };
     if let Some(seconds) = args.benchmark_seconds {
         app.insert_resource(benchmark::HeadlessBenchmark::new(seconds));
     }
     // Loaded before the UI starts, so the settings screen opens on the
     // remembered values. Benchmark and harness runs neither follow nor
     // change the user's settings.
-    let measuring = args.benchmark_seconds.is_some()
-        || std::env::var_os(performance::PERF_CONFIG_ENV).is_some();
     let settings = if measuring {
         media_settings::LoadedSettings {
             media: MediaSettings::in_memory(),
             playback: PlaybackSettings::default(),
             audio: AudioSettings::default(),
+            animations: AnimationSettings::default(),
+            view: ViewSettings::default(),
         }
     } else {
         MediaSettings::load()
@@ -356,6 +415,9 @@ fn main() -> Result<()> {
     app.insert_resource(ClearColor(Color::srgb(0.025, 0.027, 0.032)))
         .insert_resource(settings.audio)
         .insert_resource(settings.playback)
+        .insert_resource(settings.animations)
+        .insert_resource(settings.view)
+        .init_resource::<HudVisibility>()
         .insert_resource(settings.media)
         .init_resource::<MediaProbes>()
         .insert_resource(VideoPlaybackState::new(args.max_video_fps))
@@ -365,12 +427,12 @@ fn main() -> Result<()> {
             image_points,
             client,
             projection_limit: args.limit,
-            coordinate_spacing: args.spacing,
-            duplicate_spacing: args.duplicates,
+            folders: FolderScene::default(),
+            folder_generation: 0,
             texture_budget_mib: args.texture_budget_mib,
             image_concurrency: args.image_concurrency,
             max_texture_side: args.max_texture_side,
-            billboard_world_size: image_world_size,
+            billboard_world_size: BILLBOARD_WORLD_SIZE,
             camera_speed,
             navigation_reference_distance,
             initial_view_distance,
@@ -379,12 +441,34 @@ fn main() -> Result<()> {
         })
         .insert_resource(ControlPanelState::new(args.controls.clone()))
         .insert_resource(RestoredCatalogRoots(last_catalog_roots))
+        .init_resource::<FolderViewState>()
+        .init_resource::<BillboardHover>()
+        .init_resource::<WithheldPlaceholders>()
+        .add_event::<FolderCommand>()
         .init_resource::<CatalogLoadTask>()
         .init_resource::<InitialPlayerPlacement>()
         .init_resource::<FolderPickTask>()
         .init_resource::<LastPickedFolder>()
         .init_resource::<UiInputCapture>()
+        .insert_resource(control_bindings)
+        .insert_resource(controls_store)
+        .init_resource::<ControlInputState>()
+        .init_resource::<BindingEditor>()
+        .init_resource::<ControlsSheetState>()
+        .init_resource::<TextEntry>()
+        .init_resource::<TypingFocus>()
         .init_resource::<RightDragCursorState>()
+        .init_resource::<CameraFlight>()
+        .init_resource::<FolderHandles>()
+        .init_resource::<FolderRename>()
+        .init_resource::<DropTargets>()
+        .init_resource::<SelectionBox>()
+        .init_resource::<ArrangementHistory>()
+        .init_resource::<SearchControls>()
+        .init_resource::<EditControls>()
+        .init_resource::<SearchState>()
+        .insert_resource(FolderControls::with_display(arrangements.folder_display()))
+        .insert_resource(arrangements)
         .add_event::<WorldRightClick>()
         .init_resource::<BillboardMenuTarget>()
         .init_non_send_resource::<ClipboardHandle>()
@@ -433,6 +517,7 @@ fn main() -> Result<()> {
                     ..default()
                 }),
         )
+        .add_plugins(FolderWallPlugin)
         .add_plugins(performance::PerformanceHarnessPlugin)
         // Feeds the in-app catalog benchmark's hardware section. Sampling is
         // throttled internally and runs off the main thread.
@@ -455,7 +540,12 @@ fn main() -> Result<()> {
         // Positions first, so the settings written on exit include them.
         .add_systems(
             Last,
-            (remember_positions_on_exit, save_media_settings_on_exit).chain(),
+            (
+                remember_positions_on_exit,
+                save_media_settings_on_exit,
+                keep_arrangements_on_exit,
+            )
+                .chain(),
         )
         .add_systems(Update, enable_gpu_upload_budget_after_startup)
         // Sampled after bevy_ui focus so every Update system shares one
@@ -463,6 +553,12 @@ fn main() -> Result<()> {
         .add_systems(
             PreUpdate,
             update_ui_input_capture.after(bevy::ui::UiSystem::Focus),
+        )
+        // Before anything reads input as actions, so double-taps and the
+        // actions that toggle are current for the whole frame.
+        .add_systems(
+            PreUpdate,
+            update_control_input_state.after(bevy::input::InputSystem),
         )
         .init_resource::<performance::FrameStageProbe>()
         // Clears the previous frame's stamps before recording this one, so
@@ -478,18 +574,34 @@ fn main() -> Result<()> {
                     handle_navigation_buttons,
                     handle_control_buttons,
                     handle_control_keyboard,
+                    handle_text_entry_keyboard,
                     handle_control_dropdown_scroll,
                     // Rebuilds the widget subtree after this frame's clicks
                     // are applied and before anything queries the new
                     // entities, so a press is never lost to a rebuild.
                     rebuild_control_widgets,
                     handle_billboard_buttons,
+                    handle_folder_buttons,
+                    handle_edit_buttons,
+                    handle_search_buttons,
+                    apply_search_typing,
                     handle_debug_buttons,
                     handle_performance_buttons,
                     handle_pause_menu_buttons,
                     handle_resolution_buttons,
                     handle_audio_buttons,
+                    handle_animation_buttons,
                     handle_start_menu_buttons,
+                    (
+                        handle_controls_sheet_buttons,
+                        // After the sheet's buttons, so the click that begins
+                        // a capture is not taken for the binding.
+                        capture_binding,
+                        scroll_controls_sheet,
+                    )
+                        .chain(),
+                    // Last, so keys stand down the frame typing starts.
+                    update_typing_focus,
                 )
                     .chain(),
                 performance::stamp_stage("ui_buttons"),
@@ -497,10 +609,16 @@ fn main() -> Result<()> {
                     (
                         restore_last_catalog,
                         handle_start_menu_requests,
+                        reset_catalog_layout,
                         poll_folder_pick_task,
                         apply_control_submit_requests,
                         performance::stamp_stage("menu_requests"),
+                        apply_folder_requests,
+                        apply_edit_requests,
                         poll_catalog_load_task,
+                        // After the poll, so a finished load frees the task
+                        // for a relayout in the same frame.
+                        apply_folder_changes,
                         performance::stamp_stage("poll_catalog_load_task"),
                     )
                         .chain(),
@@ -521,13 +639,17 @@ fn main() -> Result<()> {
             (
                 (
                     toggle_pause_menu,
+                    toggle_hud,
                     manage_right_drag_cursor,
+                    show_look_crosshair,
                     handle_axis_gizmo_clicks,
                     update_axis_gizmo_hover,
                     update_axis_gizmo_face_highlight,
                     apply_axis_gizmo_requests,
                     fly_camera_controls,
                     teleport_on_arrow_keys,
+                    fit_selection_to_view,
+                    fly_camera_to_fit,
                     sync_axis_gizmo_camera,
                     refresh_axis_gizmo_labels,
                     sync_axis_gizmo_labels,
@@ -540,13 +662,20 @@ fn main() -> Result<()> {
                         release_slider_drag,
                         handle_video_strip_input,
                         handle_video_keyboard,
-                        handle_selection_and_drag,
+                        (handle_selection_and_drag, select_everything_shown).chain(),
+                        update_drop_targets,
+                        update_billboard_hover,
+                        apply_folder_commands,
+                        apply_folder_rename,
+                        record_arrangement_history,
+                        (remember_camera_pose, keep_arrangements).chain(),
+                        run_search,
                         reveal_hovered_videos,
                         sync_translate_gizmo,
                         advance_video_clocks,
                         sync_video_audio,
                         remember_playback_positions,
-                        save_media_settings,
+                        (save_media_settings, keep_control_bindings).chain(),
                         update_decode_budget,
                     )
                         .chain(),
@@ -557,10 +686,28 @@ fn main() -> Result<()> {
                         performance::stamp_stage("video_frames"),
                         schedule_image_loads,
                         performance::stamp_stage("schedule_image_loads"),
-                        receive_image_loads,
+                        // Launching right after the spawn, so a revealed
+                        // image never draws a frame at its final place.
+                        (receive_image_loads, launch_revealed_images).chain(),
                         performance::stamp_stage("receive_image_loads"),
                         publish_image_loading_stats,
-                        face_billboards_to_camera,
+                        (
+                            face_billboards_to_camera,
+                            // After facing, which skips work while the
+                            // camera holds still: these re-face what they
+                            // move.
+                            animate_billboards,
+                            animate_retiring_billboards,
+                            sync_folder_shells,
+                            animate_folder_shells,
+                            sync_folder_labels,
+                            place_folder_handles,
+                            // Before the point cloud bakes this frame's
+                            // rebuilt chunks.
+                            withhold_revealed_placeholders,
+                            release_withheld_placeholders,
+                        )
+                            .chain(),
                         // Strips follow this frame's billboard poses and
                         // visibility, so they never trail a moving view.
                         (
@@ -598,7 +745,11 @@ fn main() -> Result<()> {
                 )
                     .chain(),
             )
-                .chain(),
+                .chain()
+                // Reads input as actions, so after this frame's typing and
+                // capture state is settled: the key that ends a capture or an
+                // edit must not also reach the world or the pause menu.
+                .after(update_typing_focus),
         )
         .add_systems(
             Update,
@@ -606,10 +757,13 @@ fn main() -> Result<()> {
                 update_navigation_text,
                 update_control_text,
                 update_billboard_text,
+                update_folder_text,
+                update_search_text,
                 update_debug_text,
                 update_performance_text,
                 update_resolution_text,
                 update_audio_text,
+                update_animation_text,
                 update_start_text,
             )
                 .chain()
@@ -626,11 +780,18 @@ fn main() -> Result<()> {
                 update_navigation_panels,
                 update_control_panels,
                 update_billboard_panels,
+                update_folder_panels,
+                update_search_panels,
                 update_debug_panels,
                 update_performance_panels,
                 update_pause_panels,
+                update_animation_panels,
                 update_start_panels,
                 update_perf_graph_bars,
+                update_rename_prompt,
+                update_controls_sheet,
+                update_hud_panels,
+                update_selection_box,
             )
                 .chain()
                 .after(face_billboards_to_camera)
@@ -646,10 +807,15 @@ fn main() -> Result<()> {
                 update_navigation_button_colors,
                 update_control_button_colors,
                 update_billboard_button_colors,
+                update_folder_button_colors,
+                update_edit_button_colors,
+                update_search_button_colors,
                 update_debug_button_colors,
                 update_performance_button_colors,
                 update_pause_button_colors,
                 update_resolution_button_colors,
+                update_animation_button_colors,
+                update_controls_sheet_colors,
                 update_start_button_colors,
             )
                 .chain()
@@ -714,6 +880,7 @@ fn setup_scene(
     mut initial_player_placement: ResMut<InitialPlayerPlacement>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut wall_materials: ResMut<Assets<FolderWallMaterial>>,
     mut color_materials: ResMut<Assets<ColorMaterial>>,
     mut images: ResMut<Assets<Image>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -746,6 +913,16 @@ fn setup_scene(
     };
     commands.insert_resource(billboard_mesh);
     commands.insert_resource(BillboardWorldSize(scene.billboard_world_size));
+    commands.insert_resource(FolderShellAssets::new(
+        &mut meshes,
+        &mut wall_materials,
+        scene.billboard_world_size,
+    ));
+    commands.insert_resource(FolderHandleAssets::new(
+        &mut meshes,
+        &mut images,
+        &mut materials,
+    ));
     commands.insert_resource(billboard_axis_labels(&scene.projection.axis_labels));
     commands.insert_resource(scene_render_target);
     commands.insert_resource(ImageLoadingState::new(
@@ -804,7 +981,7 @@ fn setup_scene(
         &mut commands,
         &mut meshes,
         &mut materials,
-        point_cloud_points(&scene.projection),
+        point_cloud_points(&scene.image_points),
         point_size,
     );
     commands.insert_resource(cloud);
@@ -816,6 +993,8 @@ fn setup_scene(
         window_logical_size,
     );
     spawn_viewer_ui(&mut commands);
+    spawn_look_crosshair(&mut commands);
+    spawn_selection_box(&mut commands);
     spawn_axis_gizmo_3d(
         &mut commands,
         &mut meshes,
@@ -824,7 +1003,12 @@ fn setup_scene(
         &scene.axis_labels,
     );
 
-    let dense_center = median_position(&scene.projection.points);
+    let image_positions: Vec<Vec3> = scene
+        .image_points
+        .iter()
+        .map(|point| point.position)
+        .collect();
+    let dense_center = median_position(&image_positions);
     let distance = scene.initial_view_distance;
     let mut camera_transform = Transform::default();
     let mut fly_camera = FlyCamera {
@@ -1106,6 +1290,22 @@ fn sync_render_target_presentation(
     }
 }
 
+/// Puts the camera at `translation`, looking along `yaw` and `pitch`, at
+/// rest.
+fn place_camera_at_pose(
+    transform: &mut Transform,
+    camera: &mut FlyCamera,
+    translation: Vec3,
+    yaw: f32,
+    pitch: f32,
+) {
+    transform.translation = translation;
+    transform.rotation = fly_camera_rotation(yaw, pitch);
+    camera.yaw = yaw;
+    camera.pitch = pitch;
+    camera.velocity = Vec3::ZERO;
+}
+
 fn place_camera_at_initial_view(
     transform: &mut Transform,
     camera: &mut FlyCamera,
@@ -1120,13 +1320,14 @@ fn place_camera_at_initial_view(
     camera.velocity = Vec3::ZERO;
 }
 
-fn navigation_speed(nearest_gap: f32, coordinate_spacing: f32) -> f32 {
-    let coordinate_spacing = coordinate_spacing.max(1.0);
-    (nearest_gap.max(0.1) * 1.4).clamp(coordinate_spacing * 0.35, coordinate_spacing * 1.35)
+/// `cell` is the distance between neighbouring layout cubes.
+fn navigation_speed(nearest_gap: f32, cell: f32) -> f32 {
+    let cell = cell.max(1.0);
+    (nearest_gap.max(0.1) * 1.4).clamp(cell * 0.35, cell * 1.35)
 }
 
-fn initial_camera_distance(coordinate_spacing: f32, billboard_world_size: f32) -> f32 {
-    coordinate_spacing.max(billboard_world_size).max(1.0) * 2.5
+fn initial_camera_distance(cell: f32, billboard_world_size: f32) -> f32 {
+    cell.max(billboard_world_size).max(1.0) * 2.5
 }
 
 fn scene_camera_far_plane(bounds_extent: f32) -> f32 {
@@ -1153,28 +1354,46 @@ fn enforce_min_window_size(mut windows: Query<&mut Window, With<PrimaryWindow>>)
         .set(width.max(MIN_WINDOW_WIDTH), height.max(MIN_WINDOW_HEIGHT));
 }
 
+/// The pause key steps back one thing at a time: an open right-click menu
+/// closes itself, then whatever is being typed stops, then the selection
+/// clears, and only then does the pause menu open (or step back a level).
+/// The controls key opens the menu straight on the controls sheet.
+#[allow(clippy::too_many_arguments)]
 fn toggle_pause_menu(
-    keyboard: Res<ButtonInput<KeyCode>>,
+    input: ControlInput,
     ui_capture: Res<UiInputCapture>,
     mut pause_menu: ResMut<PauseMenuState>,
     mut controls: ResMut<ControlPanelState>,
+    mut text_entry: ResMut<TextEntry>,
+    mut selection: ResMut<SelectionState>,
     mut query: Query<&mut FlyCamera>,
 ) {
-    // An open right-click menu takes the press to close itself.
-    if !keyboard.just_pressed(KeyCode::Escape) || ui_capture.context_menu_open {
+    let stop_camera = |query: &mut Query<&mut FlyCamera>| {
+        if let Ok(mut camera) = query.get_single_mut() {
+            camera.velocity = Vec3::ZERO;
+        }
+    };
+    if input.just_pressed(Action::ShowControls) {
+        pause_menu.toggle_controls();
+        stop_camera(&mut query);
         return;
     }
-    // Escape first releases whatever the control panel has focused — an open
-    // dropdown or a text field being typed into. Only a second press reaches
-    // the pause menu.
+    if !input.just_pressed(Action::PauseMenu) || ui_capture.context_menu_open {
+        return;
+    }
     if controls.input_focused() {
         controls.clear_focus();
         return;
     }
-    pause_menu.escape_pressed();
-    if let Ok(mut camera) = query.get_single_mut() {
-        camera.velocity = Vec3::ZERO;
+    if text_entry.is_active() {
+        text_entry.cancel();
+        return;
     }
+    if !pause_menu.paused && selection.clear() {
+        return;
+    }
+    pause_menu.escape_pressed();
+    stop_camera(&mut query);
 }
 
 /// Every camera rendering into the shared scene render target: the fly
@@ -1289,7 +1508,6 @@ fn fly_camera_controls(
     mut navigation_settings: ResMut<NavigationSettings>,
     right_drag: Res<RightDragCursorState>,
     pause_menu: Res<PauseMenuState>,
-    controls: Res<ControlPanelState>,
     selection: Res<SelectionState>,
     mut axis_gizmo: ResMut<AxisGizmoState>,
     mut query: FlyCameraTransformQuery,
@@ -1310,7 +1528,7 @@ fn fly_camera_controls(
     // edit it, so neither may drive the camera. While a manual-spacing drag
     // is live, the wheel adjusts the dragged selection's distance instead of
     // the fly speed.
-    let panel_focused = controls.input_focused();
+    let panel_focused = input.controls.typing();
     if panel_focused || selection.drag_active() {
         input.mouse_wheel.clear();
     } else {
@@ -1321,7 +1539,7 @@ fn fly_camera_controls(
 
     // Only a right press that began in the world looks around; one that
     // began over UI or an open menu belongs to them.
-    if input.mouse_buttons.pressed(MouseButton::Right) && right_drag.anchor.is_some() {
+    if input.controls.pressed(Action::Look) && right_drag.anchor.is_some() {
         let mut rotated = false;
         for motion in input.mouse_motion.read() {
             camera.yaw -= motion.delta.x * camera.sensitivity;
@@ -1340,9 +1558,7 @@ fn fly_camera_controls(
     let forward = transform.rotation.mul_vec3(Vec3::NEG_Z);
     let right = transform.rotation.mul_vec3(Vec3::X);
     let up = transform.rotation.mul_vec3(Vec3::Y);
-    let shift_multiplier = if input.keyboard.pressed(KeyCode::ShiftLeft)
-        || input.keyboard.pressed(KeyCode::ShiftRight)
-    {
+    let shift_multiplier = if input.controls.pressed(Action::MoveFaster) {
         navigation_settings.shift_speed_multiplier
     } else {
         1.0
@@ -1350,7 +1566,7 @@ fn fly_camera_controls(
     let movement = if panel_focused {
         Vec3::ZERO
     } else {
-        movement_from_keys(forward, right, up, |key| input.keyboard.pressed(key))
+        movement_from_actions(forward, right, up, |action| input.controls.pressed(action))
     };
     navigation_settings.update_cruise_pressure(movement, camera.velocity, input.time.delta_secs());
     let status = navigation_status(&navigation_settings).with_velocity_multiplier(shift_multiplier);
@@ -1374,12 +1590,13 @@ fn fly_camera_controls(
     transform.translation += camera.velocity * input.time.delta_secs();
 }
 
-/// Hides and pins the cursor while the right button is dragged in the world,
-/// and restores it on release. A plain right click (no motion beyond
-/// `RIGHT_DRAG_MOTION_THRESHOLD`) leaves the cursor untouched, as does a
-/// right press that starts over UI or while a menu is open.
+/// Hides the cursor and pins it to the center of the view while the right
+/// button is dragged in the world, so hover effects follow the look
+/// crosshair, and shows it there again on release. A plain right click (no
+/// motion beyond `RIGHT_DRAG_MOTION_THRESHOLD`) leaves the cursor untouched,
+/// as does a right press that starts over UI or while a menu is open.
 fn manage_right_drag_cursor(
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    input: ControlInput,
     mut mouse_motion: EventReader<MouseMotion>,
     ui_capture: Res<UiInputCapture>,
     pause_menu: Res<PauseMenuState>,
@@ -1391,14 +1608,14 @@ fn manage_right_drag_cursor(
         return;
     };
     let menu_open = pause_menu.paused || ui_capture.menu_open || ui_capture.context_menu_open;
+    let center = view_center(&window);
 
-    if mouse_buttons.just_pressed(MouseButton::Right) && !menu_open && !ui_capture.pointer_over_ui {
+    if input.just_pressed(Action::Look) && !menu_open && !ui_capture.pointer_over_ui {
         state.anchor = window.cursor_position();
         state.accumulated_motion = 0.0;
     }
 
-    let drag_active =
-        state.anchor.is_some() && mouse_buttons.pressed(MouseButton::Right) && !menu_open;
+    let drag_active = state.anchor.is_some() && input.pressed(Action::Look) && !menu_open;
     if drag_active {
         if !state.dragging {
             state.accumulated_motion += mouse_motion
@@ -1407,25 +1624,20 @@ fn manage_right_drag_cursor(
                 .sum::<f32>();
             if state.accumulated_motion >= RIGHT_DRAG_MOTION_THRESHOLD {
                 state.dragging = true;
-                // Re-pin to the anchor before flipping grab/visibility: bevy's
+                // Move to the center before flipping grab/visibility: bevy's
                 // window sync applies a cursor-position change before grab
                 // mode changes within the same frame, so `Locked` captures
                 // this position rather than wherever the threshold crossed.
-                window.set_cursor_position(state.anchor);
+                window.set_cursor_position(Some(center));
                 window.cursor_options.visible = false;
-                // `Confined` on Windows has a winit-specific quirk: combined
-                // with a hidden cursor it clips to the *window's center*
-                // (a workaround so a hidden cursor can't drift onto the
-                // taskbar), not wherever the cursor actually is — which is
-                // why an earlier version of this teleported to the center
-                // instead of the click point. `Locked` clips to the cursor's
-                // current position instead, which is the lock-in-place
-                // behavior this drag needs.
+                // `Locked` holds the cursor where it is on every platform;
+                // `Confined` with a hidden cursor happens to clip to the
+                // window's center on Windows only.
                 window.cursor_options.grab_mode = CursorGrabMode::Locked;
             }
         }
         if state.dragging {
-            window.set_cursor_position(state.anchor);
+            window.set_cursor_position(Some(center));
         }
         return;
     }
@@ -1434,8 +1646,9 @@ fn manage_right_drag_cursor(
     if state.dragging {
         window.cursor_options.visible = true;
         window.cursor_options.grab_mode = CursorGrabMode::None;
-        window.set_cursor_position(state.anchor);
-    } else if state.anchor.is_some() && mouse_buttons.just_released(MouseButton::Right) {
+        // Left where the crosshair was, over what it was hovering.
+        window.set_cursor_position(Some(center));
+    } else if state.anchor.is_some() && input.just_released(Action::Look) {
         // Released before the drag threshold: a click, not a look.
         right_clicks.send(WorldRightClick);
     }
@@ -1444,30 +1657,42 @@ fn manage_right_drag_cursor(
     state.dragging = false;
 }
 
-fn movement_from_keys<F>(forward: Vec3, right: Vec3, up: Vec3, pressed: F) -> Vec3
+/// The center of the window, in logical pixels.
+fn view_center(window: &Window) -> Vec2 {
+    Vec2::new(window.width(), window.height()) * 0.5
+}
+
+/// Shows the look crosshair for exactly as long as the view is dragged.
+fn show_look_crosshair(
+    state: Res<RightDragCursorState>,
+    mut crosshair: Query<&mut Visibility, With<LookCrosshair>>,
+) {
+    let visibility = if state.look_dragging() {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut shown in &mut crosshair {
+        shown.set_if_neq(visibility);
+    }
+}
+
+fn movement_from_actions<F>(forward: Vec3, right: Vec3, up: Vec3, pressed: F) -> Vec3
 where
-    F: Fn(KeyCode) -> bool,
+    F: Fn(Action) -> bool,
 {
-    let mut movement = Vec3::ZERO;
-    if pressed(KeyCode::KeyW) {
-        movement += forward;
-    }
-    if pressed(KeyCode::KeyS) {
-        movement -= forward;
-    }
-    if pressed(KeyCode::KeyD) {
-        movement += right;
-    }
-    if pressed(KeyCode::KeyA) {
-        movement -= right;
-    }
-    if pressed(KeyCode::Space) {
-        movement += up;
-    }
-    if pressed(KeyCode::ControlLeft) || pressed(KeyCode::ControlRight) {
-        movement -= up;
-    }
-    movement
+    [
+        (Action::MoveForward, forward),
+        (Action::MoveBack, -forward),
+        (Action::MoveRight, right),
+        (Action::MoveLeft, -right),
+        (Action::MoveUp, up),
+        (Action::MoveDown, -up),
+    ]
+    .into_iter()
+    .filter(|&(action, _)| pressed(action))
+    .map(|(_, direction)| direction)
+    .sum()
 }
 
 /// Arrow keys teleport to the nearest visible image along a world axis. The
@@ -1489,7 +1714,7 @@ where
 /// into the translation and ratcheting the camera toward the images.
 #[allow(clippy::too_many_arguments)]
 fn teleport_on_arrow_keys(
-    keyboard: Res<ButtonInput<KeyCode>>,
+    input: ControlInput,
     pause_menu: Res<PauseMenuState>,
     controls: Res<ControlPanelState>,
     targets: Res<NavigationTargets>,
@@ -1504,20 +1729,22 @@ fn teleport_on_arrow_keys(
     // Right shift retargets up/down from the screen-up axis to the view
     // direction, so the same snap-to-next-coordinate step travels forward and
     // backward through the lattice instead of climbing it.
-    let depth_travel = keyboard.pressed(KeyCode::ShiftRight);
+    let depth_travel = input.pressed(Action::StepThroughDepth);
     let (up_axis, up_sign) = if depth_travel {
         (Vec3::NEG_Z, 1.0)
     } else {
         (Vec3::Y, 1.0)
     };
     let Some(axis) = [
-        (KeyCode::ArrowRight, Vec3::X, 1.0),
-        (KeyCode::ArrowLeft, Vec3::X, -1.0),
-        (KeyCode::ArrowUp, up_axis, up_sign),
-        (KeyCode::ArrowDown, up_axis, -up_sign),
+        (Action::StepRight, Vec3::X, 1.0),
+        (Action::StepLeft, Vec3::X, -1.0),
+        (Action::StepUp, up_axis, up_sign),
+        (Action::StepDown, up_axis, -up_sign),
     ]
     .into_iter()
-    .find_map(|(key, local_axis, sign)| keyboard.just_pressed(key).then_some((local_axis, sign))) else {
+    .find_map(|(action, local_axis, sign)| {
+        input.just_pressed(action).then_some((local_axis, sign))
+    }) else {
         return;
     };
     let Ok((mut transform, mut camera)) = query.get_single_mut() else {
@@ -1548,13 +1775,13 @@ fn teleport_on_arrow_keys(
     };
     // Only step to images the user can currently see: skip anything sliced
     // away around the camera or beyond the view-bounds walls.
-    let slice_radius = controls.slice_depth_cells() * scene.coordinate_spacing;
+    let slice_radius = controls.slice_depth_cells() * scene.billboard_world_size;
     let visible = |position: Vec3| {
         !bounds.is_beyond(camera_position, position)
             && (slice_radius <= 0.0
                 || position.distance_squared(camera_position) >= slice_radius * slice_radius)
     };
-    let min_advance = scene.coordinate_spacing * TELEPORT_MIN_ADVANCE_FACTOR;
+    let min_advance = scene.billboard_world_size * TELEPORT_MIN_ADVANCE_FACTOR;
     let Some(target) = targets.nearest_in_direction(anchor, travel_axis, min_advance, visible)
     else {
         return;
@@ -1636,7 +1863,7 @@ fn apply_billboard_visibility(
     mut billboards: Query<(Ref<MediaBillboard>, &Transform, &mut Visibility)>,
     mut last_applied: Local<Option<(Vec3, Quat, f32, usize)>>,
 ) {
-    let radius = controls.slice_depth_cells() * scene.coordinate_spacing;
+    let radius = controls.slice_depth_cells() * scene.billboard_world_size;
     let active = radius > 0.0;
     let Ok(camera_transform) = camera_query.get_single() else {
         return;
@@ -1704,8 +1931,9 @@ fn apply_point_cloud_slice(
         return;
     };
     let camera = camera_transform.translation;
-    let radius = (controls.slice_depth_cells() * scene.coordinate_spacing).max(0.0);
-    let move_threshold_squared = (scene.coordinate_spacing * 0.1).powi(2);
+    let cell = scene.billboard_world_size;
+    let radius = (controls.slice_depth_cells() * cell).max(0.0);
+    let move_threshold_squared = (cell * 0.1).powi(2);
     let needs_apply = match *last_applied {
         None => radius > 0.0,
         Some((previous_camera, previous_radius, previous_epoch)) => {
@@ -1842,25 +2070,37 @@ mod tests {
         // bounding box far past where most points actually live; the median
         // should stay inside the dense cluster instead of drifting toward an
         // empty region like `Bounds3::center` (the min/max midpoint) does.
-        let make_point = |image_id: usize, position: [f32; 3]| spatial_api::ProjectionPoint {
-            image_id,
-            path: String::new(),
-            position,
-            width: None,
-            height: None,
-            media_type: "image".to_owned(),
-            duration_seconds: None,
-            coordinate_labels: [None, None, None],
-        };
-        let points = vec![
-            make_point(0, [0.0, 0.0, 0.0]),
-            make_point(1, [1.0, 1.0, 1.0]),
-            make_point(2, [2.0, 2.0, 10_000.0]),
+        let points = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 1.0),
+            Vec3::new(2.0, 2.0, 10_000.0),
         ];
         let median = median_position(&points);
         assert_eq!(median.z, 1.0);
-        let bounds = projection_bounds(&points);
+        let bounds = bounds_of(points);
         assert!(median.z < bounds.center.z);
+    }
+
+    /// Keys and mouse buttons are read through `ControlInput` alone, so
+    /// every control is in the bindings table and on the controls sheet. The
+    /// performance harness presses keys, but finds them through the bindings.
+    #[test]
+    fn no_input_is_read_outside_the_bindings() {
+        let sources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in std::fs::read_dir(sources).expect("source directory") {
+            let path = entry.expect("source entry").path();
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("source file");
+            for forbidden in ["KeyCode", "MouseButton"].map(|name| format!("{name}::")) {
+                assert!(
+                    !source.contains(forbidden.as_str()),
+                    "{} reads {forbidden} directly; bind it to an Action instead",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1880,30 +2120,30 @@ mod tests {
     }
 
     #[test]
-    fn space_and_ctrl_move_along_view_up_axis() {
+    fn moving_up_and_down_follows_the_view_up_axis() {
         // Looking straight down, the view's up vector points along -Z, so
         // Space must move toward -Z rather than world +Y.
         let rotation = fly_camera_rotation(0.0, -std::f32::consts::FRAC_PI_2);
         let up = rotation.mul_vec3(Vec3::Y);
 
-        let ascend = movement_from_keys(Vec3::ZERO, Vec3::ZERO, up, |key| {
-            matches!(key, KeyCode::Space)
+        let ascend = movement_from_actions(Vec3::ZERO, Vec3::ZERO, up, |action| {
+            action == Action::MoveUp
         });
         assert!((ascend - up).length() < 0.0001);
         assert!(ascend.z < -0.99);
 
-        let descend = movement_from_keys(Vec3::ZERO, Vec3::ZERO, up, |key| {
-            matches!(key, KeyCode::ControlLeft)
+        let descend = movement_from_actions(Vec3::ZERO, Vec3::ZERO, up, |action| {
+            action == Action::MoveDown
         });
         assert!((descend + up).length() < 0.0001);
     }
 
     #[test]
     fn arrow_keys_no_longer_feed_continuous_movement() {
-        let movement = movement_from_keys(Vec3::NEG_Z, Vec3::X, Vec3::Y, |key| {
+        let movement = movement_from_actions(Vec3::NEG_Z, Vec3::X, Vec3::Y, |action| {
             matches!(
-                key,
-                KeyCode::ArrowRight | KeyCode::ArrowLeft | KeyCode::ArrowUp | KeyCode::ArrowDown
+                action,
+                Action::StepRight | Action::StepLeft | Action::StepUp | Action::StepDown
             )
         });
 
@@ -2010,6 +2250,7 @@ mod tests {
         app.insert_resource(SelectionState::default());
         app.insert_resource(PauseMenuState::default());
         app.insert_resource(AudioPlaybackState::without_output());
+        app.init_resource::<VideoPlaybackState>();
         app.insert_resource(MediaSettings::in_memory());
         app.init_resource::<MediaProbes>();
         app.init_resource::<PlaybackSettings>();
@@ -2047,10 +2288,14 @@ mod tests {
         app.init_resource::<VideoControlsState>();
         app.init_resource::<VideoPlaybackState>();
         app.init_resource::<MediaProbes>();
+        app.init_resource::<FolderHandles>();
+        app.init_resource::<ArrangementHistory>();
+        app.init_resource::<FolderControls>();
         app.insert_resource(MediaSettings::in_memory());
         app.insert_resource(BillboardMenuTarget::video(7, PATH));
         app.init_non_send_resource::<ClipboardHandle>();
         app.add_event::<WorldRightClick>();
+        app.add_event::<FolderCommand>();
         app.add_systems(
             Update,
             billboard_menu_systems()
@@ -2076,10 +2321,10 @@ mod tests {
         assert_eq!(settings.video(PATH).speed, 1.5);
     }
 
-    /// Pointer-driven systems need a window and input resources to run, but
+    /// Input-driven systems need a window and input resources to run, but
     /// parameter conflicts already surface when a system is initialized.
     #[test]
-    fn video_input_systems_initialize_without_param_conflicts() {
+    fn input_systems_initialize_without_param_conflicts() {
         fn initialize<Marker>(world: &mut World, system: impl IntoSystem<(), (), Marker>) {
             IntoSystem::into_system(system).initialize(world);
         }
@@ -2088,17 +2333,58 @@ mod tests {
         initialize(&mut world, handle_video_keyboard);
         initialize(&mut world, reveal_hovered_videos);
         initialize(&mut world, handle_selection_and_drag);
+        initialize(&mut world, select_everything_shown);
+        initialize(&mut world, keep_control_bindings);
+        initialize(&mut world, update_control_input_state);
+        initialize(&mut world, handle_controls_sheet_buttons);
+        initialize(&mut world, capture_binding);
+        initialize(&mut world, scroll_controls_sheet);
+        initialize(&mut world, update_controls_sheet);
+        initialize(&mut world, update_controls_sheet_colors);
         initialize(&mut world, sync_video_strips);
         initialize(&mut world, billboard_menu::open_billboard_menu);
+        initialize(&mut world, toggle_pause_menu);
+        initialize(&mut world, fly_camera_controls);
+        initialize(&mut world, manage_right_drag_cursor);
+        initialize(&mut world, teleport_on_arrow_keys);
+        initialize(&mut world, fit_selection_to_view);
+        initialize(&mut world, fly_camera_to_fit);
+        initialize(&mut world, apply_folder_commands);
+        initialize(&mut world, apply_folder_rename);
+        initialize(&mut world, apply_folder_requests);
+        initialize(&mut world, apply_edit_requests);
+        initialize(&mut world, reset_catalog_layout);
+        initialize(&mut world, record_arrangement_history);
+        initialize(&mut world, keep_arrangements);
+        initialize(&mut world, remember_camera_pose);
+        initialize(&mut world, toggle_hud);
+        initialize(&mut world, update_hud_panels);
+        initialize(&mut world, handle_start_menu_requests);
+        initialize(&mut world, keep_arrangements_on_exit);
+        initialize(&mut world, run_search);
+        initialize(&mut world, update_drop_targets);
+        initialize(&mut world, update_billboard_hover);
+        initialize(&mut world, sync_folder_labels);
+        initialize(&mut world, place_folder_handles);
+        initialize(&mut world, animate_folder_shells);
+        initialize(&mut world, animate_billboards);
+        initialize(&mut world, animate_retiring_billboards);
+        initialize(&mut world, launch_revealed_images);
+        initialize(&mut world, withhold_revealed_placeholders);
+        initialize(&mut world, release_withheld_placeholders);
+        initialize(&mut world, handle_animation_buttons);
+        initialize(&mut world, handle_axis_gizmo_clicks);
+        initialize(&mut world, release_slider_drag);
+        initialize(&mut world, handle_text_entry_keyboard);
+        initialize(&mut world, update_typing_focus);
+        initialize(&mut world, spatial_viewer_ui::handle_search_buttons);
+        initialize(&mut world, apply_search_typing);
     }
 
     pub(crate) fn test_scene() -> ExplorerScene {
         ExplorerScene {
             projection: spatial_api::ProjectionPage {
                 axis_labels: [None, None, None],
-                coordinate_spacing: 6.0,
-                duplicate_spacing: 0.8,
-                sprite_world_height: 4.68,
                 offset: 0,
                 limit: 0,
                 total: 0,
@@ -2113,12 +2399,12 @@ mod tests {
             image_points: Vec::new(),
             client: SpatialApiClient::new("http://127.0.0.1:8765"),
             projection_limit: 0,
-            coordinate_spacing: 6.0,
-            duplicate_spacing: 0.8,
+            folders: FolderScene::default(),
+            folder_generation: 0,
             texture_budget_mib: 1024,
             image_concurrency: 1,
             max_texture_side: 0,
-            billboard_world_size: 4.68,
+            billboard_world_size: BILLBOARD_WORLD_SIZE,
             camera_speed: 2.0,
             navigation_reference_distance: 6.0,
             initial_view_distance: 15.0,

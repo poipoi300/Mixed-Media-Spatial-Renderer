@@ -20,15 +20,12 @@ pub struct ViewerArgs {
     /// reported once the panel arrives.
     pub controls: ControlValues,
     pub limit: usize,
-    pub spacing: f32,
-    pub duplicates: f32,
     /// VRAM ceiling in MiB for resident billboard textures. Replaces a count
     /// cap: catalog images differ ~100x in size, so a count cannot bound the
     /// memory that actually runs out.
     pub texture_budget_mib: u32,
     pub image_concurrency: usize,
     pub max_texture_side: u32,
-    pub billboard_scale: f32,
     /// Ceiling on video playback rate; a slower source plays at its native
     /// rate. Decoded frames are uncompressed, so memory and upload cost grow
     /// linearly with it.
@@ -48,8 +45,6 @@ impl ViewerArgs {
             api: "http://127.0.0.1:8765".to_owned(),
             controls: ControlValues::new(),
             limit: 10_000,
-            spacing: 6.0,
-            duplicates: 0.8,
             texture_budget_mib: spatial_viewer_ui::DEFAULT_TEXTURE_BUDGET_MIB,
             image_concurrency: 12,
             // Source resolution. Sizing every image down cost a visible
@@ -57,7 +52,6 @@ impl ViewerArgs {
             // 12% of decode time, because reading and parsing the file
             // dominates a decode regardless of the target size.
             max_texture_side: 0,
-            billboard_scale: 0.78,
             max_video_fps: DEFAULT_MAX_VIDEO_FPS,
             debug_probe_billboard: false,
             benchmark_seconds: None,
@@ -68,8 +62,6 @@ impl ViewerArgs {
                 "--api" => parsed.api = required_value(&flag, args.next())?,
                 "--control" => control_assignments.push(required_value(&flag, args.next())?),
                 "--limit" => parsed.limit = parse_value(&flag, args.next())?,
-                "--spacing" => parsed.spacing = parse_value(&flag, args.next())?,
-                "--duplicates" => parsed.duplicates = parse_value(&flag, args.next())?,
                 "--texture-budget-mib" => {
                     parsed.texture_budget_mib = parse_value(&flag, args.next())?
                 }
@@ -77,7 +69,6 @@ impl ViewerArgs {
                     parsed.image_concurrency = parse_value(&flag, args.next())?
                 }
                 "--max-texture-side" => parsed.max_texture_side = parse_value(&flag, args.next())?,
-                "--billboard-scale" => parsed.billboard_scale = parse_value(&flag, args.next())?,
                 "--max-video-fps" => parsed.max_video_fps = parse_value(&flag, args.next())?,
                 "--debug-probe-billboard" => parsed.debug_probe_billboard = true,
                 "--benchmark" => parsed.benchmark_seconds = Some(parse_value(&flag, args.next())?),
@@ -126,8 +117,6 @@ OPTIONS:
                           (e.g. --control x=0 --control shape=sphere). Which controls
                           exist is up to the API; open the View pill to see them
     --limit <COUNT>       Maximum projected points to load [default: 10000]
-    --spacing <VALUE>     Coordinate spacing [default: 6.0]
-    --duplicates <VALUE>  Duplicate coordinate spread [default: 0.8]
     --texture-budget-mib <MIB>
                           VRAM ceiling for resident billboard textures [default: 6144].
                           Adjustable at runtime from the Billboards panel
@@ -140,8 +129,6 @@ OPTIONS:
     --max-texture-side <PX>
                           Cap on the decoded texture side; 0 keeps source resolution
                           [default: 0]
-    --billboard-scale <VALUE>
-                          Billboard world size as a fraction of coordinate spacing [default: 0.78]
     --max-video-fps <FPS> Cap on video playback rate; slower videos play at their native
                           rate [default: 60]. Each playing video buffers uncompressed
                           frames, so memory grows with this (~240 MiB per second of

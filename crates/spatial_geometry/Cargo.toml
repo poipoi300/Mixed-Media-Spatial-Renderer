@@ -9,4 +9,3 @@ rust-version.workspace = true
 # Only Vec3 is needed here; depending on bevy_math directly keeps this
 # crate (and its tests) free of the full engine.
 bevy_math = { version = "0.15.3" }
-spatial_api = { path = "../spatial_api" }

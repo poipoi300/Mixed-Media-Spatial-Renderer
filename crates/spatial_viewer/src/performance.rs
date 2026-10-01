@@ -20,8 +20,8 @@ use bevy::{
 };
 use spatial_geometry::Bounds3;
 use spatial_viewer_ui::{
-    BillboardControls, BillboardStats, ControlPanelState, NavigationSettings, PauseMenuState,
-    StartMenuState, MIN_TEXTURE_BUDGET_MIB,
+    Action, BillboardControls, BillboardStats, ControlBindings, ControlPanelState, Input,
+    NavigationSettings, PauseMenuState, StartMenuState, MIN_TEXTURE_BUDGET_MIB,
 };
 
 /// Budget the harness restores after squeezing the cache, large enough that
@@ -388,8 +388,9 @@ enum ActionKind {
     CatalogFirstPoint,
     CatalogComplete,
     FirstTextureLoaded,
-    HoldKey {
-        key: KeyCode,
+    /// Holds the first key bound to `action`.
+    HoldAction {
+        action: Action,
         seconds: f64,
     },
     TapPause {
@@ -414,13 +415,15 @@ impl ActionKind {
             Self::CatalogFirstPoint => "catalog_first_point",
             Self::CatalogComplete => "catalog_complete",
             Self::FirstTextureLoaded => "first_texture_loaded",
-            Self::HoldKey {
-                key: KeyCode::KeyW, ..
+            Self::HoldAction {
+                action: Action::MoveForward,
+                ..
             } => "move_forward",
-            Self::HoldKey {
-                key: KeyCode::KeyD, ..
+            Self::HoldAction {
+                action: Action::MoveRight,
+                ..
             } => "strafe_right",
-            Self::HoldKey { .. } => "hold_key",
+            Self::HoldAction { .. } => "hold_key",
             Self::TapPause { expected: true } => "pause",
             Self::TapPause { expected: false } => "resume",
             Self::TeleportRight => "teleport_right",
@@ -503,8 +506,8 @@ fn build_timeline(config: &HarnessConfig) -> Vec<ScheduledAction> {
         scheduled(at(28.0), ActionKind::TeleportRight),
         scheduled(
             at(40.0),
-            ActionKind::HoldKey {
-                key: KeyCode::KeyW,
+            ActionKind::HoldAction {
+                action: Action::MoveForward,
                 seconds: hold(6.0),
             },
         ),
@@ -518,8 +521,8 @@ fn build_timeline(config: &HarnessConfig) -> Vec<ScheduledAction> {
         ),
         scheduled(
             at(134.0),
-            ActionKind::HoldKey {
-                key: KeyCode::KeyD,
+            ActionKind::HoldAction {
+                action: Action::MoveRight,
                 seconds: hold(5.0),
             },
         ),
@@ -539,14 +542,26 @@ fn build_timeline(config: &HarnessConfig) -> Vec<ScheduledAction> {
         ),
         scheduled(
             at(266.0),
-            ActionKind::HoldKey {
-                key: KeyCode::KeyW,
+            ActionKind::HoldAction {
+                action: Action::MoveForward,
                 seconds: hold(6.0),
             },
         ),
     ]);
     actions.sort_by(|left, right| left.scheduled_at.total_cmp(&right.scheduled_at));
     actions
+}
+
+/// The first key `action` is bound to alone (no modifiers, one tap), which
+/// the harness presses for it.
+fn bound_key(bindings: &ControlBindings, action: Action) -> Option<KeyCode> {
+    bindings
+        .chords(action)
+        .filter(|chord| chord.modifiers.is_empty() && !chord.double_tap)
+        .find_map(|chord| match chord.input {
+            Input::Key(key) => Some(key),
+            Input::Modifier(_) | Input::Mouse(_) | Input::Wheel => None,
+        })
 }
 
 fn scheduled(scheduled_at: f64, kind: ActionKind) -> ScheduledAction {
@@ -587,6 +602,7 @@ struct HarnessVideo<'w> {
 fn drive_timeline(
     mut harness: ResMut<PerformanceHarness>,
     mut keyboard: ResMut<ButtonInput<KeyCode>>,
+    bindings: Res<ControlBindings>,
     scene: Res<ExplorerScene>,
     pause_menu: Option<Res<PauseMenuState>>,
     start_menu: Option<Res<StartMenuState>>,
@@ -655,8 +671,12 @@ fn drive_timeline(
                         baseline_clock: None,
                     };
                 }
-                ActionKind::HoldKey { key, seconds } => {
-                    let Some(baseline) = camera_position else {
+                ActionKind::HoldAction {
+                    action: held,
+                    seconds,
+                } => {
+                    let (Some(baseline), Some(key)) = (camera_position, bound_key(&bindings, held))
+                    else {
                         continue;
                     };
                     keyboard.press(key);
@@ -673,9 +693,12 @@ fn drive_timeline(
                     ));
                 }
                 ActionKind::TapPause { .. } | ActionKind::TeleportRight => {
-                    let key = match action.kind {
-                        ActionKind::TapPause { .. } => KeyCode::Escape,
-                        _ => KeyCode::ArrowRight,
+                    let tapped = match action.kind {
+                        ActionKind::TapPause { .. } => Action::PauseMenu,
+                        _ => Action::StepRight,
+                    };
+                    let Some(key) = bound_key(&bindings, tapped) else {
+                        continue;
                     };
                     keyboard.press(key);
                     action.status = ActionStatus::Holding {
@@ -1010,7 +1033,7 @@ fn evaluate_action(
                 "failed": stats.map_or(0, |value| value.failed),
             }),
         ),
-        ActionKind::HoldKey { .. } => {
+        ActionKind::HoldAction { .. } => {
             let distance = camera_position
                 .zip(baseline)
                 .map(|(current, start)| current.distance(start));
@@ -1556,7 +1579,7 @@ mod tests {
         assert!((patrol.scheduled_at + seconds - 59.0).abs() < 1e-9);
         assert!(!timeline
             .iter()
-            .any(|action| matches!(action.kind, ActionKind::HoldKey { .. })));
+            .any(|action| matches!(action.kind, ActionKind::HoldAction { .. })));
     }
 
     #[test]

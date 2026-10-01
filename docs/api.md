@@ -41,6 +41,32 @@ them, so the pill always describes what is on screen:
 server names its own axes, so the viewer needs no notion of what produced the
 layout.
 
+**Positions are in cubes.** Every image fills a 1×1×1 cube, and a server lays
+cubes out touching: neighbours one unit apart.
+
+**Groups.** A point may name the group it belongs to, for example every image
+sharing a coordinate value. The viewer shows a group of two or more images as
+a folder, closed until the user opens it, and lays groups out itself so a
+closed folder takes one cube and an open one its whole block:
+
+- `key` names the group, and must stay the same across snapshots even when
+  its rank changes.
+- `index` is the group's slot along each axis, counting from 0 at the low
+  end. Groups sharing a slot line up, and each slot is as wide as the widest
+  thing the viewer shows in it.
+- `offset` is the point's cube center relative to the center of its group's
+  block.
+
+`position` still gives the point's place with every group laid out whole, for
+a client that does not lay groups out. A server without groups omits `group`,
+and the viewer then uses `position` as sent.
+
+```json
+{"image_id": 7, "path": "...", "position": [2.0, -0.5, 0.0],
+ "group": {"key": "2024-05-01", "index": [1, 0, 0], "offset": [0.0, -0.5, 0.0]},
+ "media_type": "image", "coordinate_labels": ["2024-05-01", null, null]}
+```
+
 **Widgets.** Six kinds: `group` (nests, optionally collapsible), `select`,
 `button`, `slider`, `text` and `toggle`. Each leaf carries an `id`, a `label`,
 its current `value`, and optionally `detail` and `disabled`.

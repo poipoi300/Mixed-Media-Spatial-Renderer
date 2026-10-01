@@ -48,6 +48,10 @@ pub struct AudioClockSample {
     pub playing: bool,
     /// Bumped by the clock on every discontinuous jump (seek, loop wrap).
     pub seek_generation: u64,
+    /// The picture shows the clock's frame since the clock last started.
+    /// Sound that restarts or resumes is held until then, so picture and
+    /// sound begin together.
+    pub picture_ready: bool,
     /// The video's own gain (0 while muted), which the master volume scales.
     pub gain: f32,
     pub sound: SoundChoice,
@@ -83,7 +87,8 @@ pub struct SoundTrack {
 /// [`AudioPlaybackState::clock`]). Sound streams from one ffmpeg process per
 /// playing video, started at the clock's time: play resumes it, pause pauses
 /// it, and a seek (or loop wrap) replaces it with one starting at the new
-/// time.
+/// time. A started or resumed stream stays paused, decoding ahead, until the
+/// video's picture is ready; the clock waits for the sound meanwhile.
 #[derive(Resource)]
 pub struct AudioPlaybackState {
     output: Option<OutputStreamHandle>,
@@ -102,6 +107,9 @@ struct AudioEntry {
     unplayable: Option<SoundTrack>,
     stream: Option<ActiveAudioStream>,
     was_playing: bool,
+    /// The stream was restarted or resumed and is held paused until the
+    /// picture is ready.
+    awaiting_picture: bool,
     /// Seek generation of the clock the stream was started from. Left behind
     /// by a seek until the sound restarts at it.
     seek_generation: u64,
@@ -207,6 +215,7 @@ impl AudioPlaybackState {
                 unplayable: None,
                 stream: None,
                 was_playing: false,
+                awaiting_picture: false,
                 seek_generation: 0,
                 gain: 1.0,
             },
@@ -280,18 +289,21 @@ impl AudioPlaybackState {
                         // seek made while paused or scrubbing stays pending
                         // until playback resumes.
                         entry.seek_generation = clock.seek_generation;
+                        entry.awaiting_picture = true;
                     }
-                    AudioTransition::Resume => {
-                        if let Some(stream) = entry.stream.as_ref() {
-                            stream.sink.play();
-                        }
-                    }
+                    AudioTransition::Resume => entry.awaiting_picture = true,
                     AudioTransition::Pause => {
                         if let Some(stream) = entry.stream.as_ref() {
                             stream.sink.pause();
                         }
                     }
                     AudioTransition::Keep => {}
+                }
+                if entry.awaiting_picture && clock.playing && clock.picture_ready {
+                    if let Some(stream) = entry.stream.as_ref() {
+                        stream.sink.play();
+                    }
+                    entry.awaiting_picture = false;
                 }
             }
             entry.was_playing = clock.playing;
@@ -365,7 +377,7 @@ fn audio_transition(
 }
 
 /// Replaces the entry's stream with one playing `track` for the picture at
-/// `time_seconds`.
+/// `time_seconds`, paused until the picture is ready.
 fn restart_entry(
     output: Option<&OutputStreamHandle>,
     image_id: usize,
@@ -405,8 +417,7 @@ fn restart_entry(
     };
     let progress = Arc::new(AudioStreamProgress::default());
     sink.set_volume(master_volume * entry.gain);
-    sink.append(StreamedAudioSource::new(records, progress.clone()));
-    sink.play();
+    queue_held(&sink, StreamedAudioSource::new(records, progress.clone()));
     entry.stream = Some(ActiveAudioStream {
         sink,
         progress,
@@ -415,11 +426,29 @@ fn restart_entry(
     });
 }
 
+/// Queues `source` on `sink` held until the sink plays. Paused before the
+/// source is appended, the sink never pulls from it, so the source's clock
+/// holds at its start while ffmpeg decodes ahead.
+fn queue_held(sink: &Sink, source: StreamedAudioSource) {
+    sink.pause();
+    sink.append(source);
+}
+
 /// Decodes `track` from file time `start_seconds` on, as interleaved stereo
 /// PCM at the fixed rate. The seek is an input seek, which ffmpeg makes
 /// sample-accurate when it decodes. A start before the file's leads with
 /// that much silence; a speed other than 1 is applied by `atempo`, which
 /// keeps the pitch.
+///
+/// The seek point is the file's time, but a sound track can begin after the
+/// file does. The seek trims every track to a point inside it, while a
+/// start before the track's first sample would begin the sound there, early
+/// by the gap; `aresample` pads the gap with silence so the first sample out
+/// always plays the seek point, as the picture's first frame does. With
+/// `async=1` it only fills and trims, stretching by at most a sample a
+/// second, so it treats a gap or overlap in the track's timestamps later on
+/// the same way: the sound stays on the file's timeline, which the picture
+/// follows too.
 fn audio_stream_arguments(
     path: &std::path::Path,
     start_seconds: f32,
@@ -434,7 +463,7 @@ fn audio_stream_arguments(
     if let Some(stream_index) = track.stream_index {
         arguments.extend(["-map".into(), format!("0:{stream_index}").into()]);
     }
-    let mut filters = Vec::new();
+    let mut filters = vec!["aresample=async=1:first_pts=0".to_owned()];
     if start_seconds < 0.0 {
         filters.push(format!(
             "adelay=delays={:.3}:all=1",
@@ -444,9 +473,7 @@ fn audio_stream_arguments(
     if track.speed != 1.0 {
         filters.push(format!("atempo={}", track.speed));
     }
-    if !filters.is_empty() {
-        arguments.extend(["-af".into(), filters.join(",").into()]);
-    }
+    arguments.extend(["-af".into(), filters.join(",").into()]);
     arguments.extend(
         [
             "-vn",
@@ -622,6 +649,7 @@ mod tests {
                 track: TRACK,
             }),
             was_playing,
+            awaiting_picture: false,
             seek_generation,
             gain: 1.0,
         }
@@ -639,6 +667,7 @@ mod tests {
             time_seconds: 2.0,
             playing,
             seek_generation,
+            picture_ready: true,
             gain: 1.0,
             sound: SoundChoice::Track(TRACK),
         }
@@ -722,7 +751,10 @@ mod tests {
         };
         let plain = arguments(3.0, TRACK);
         assert!(plain.windows(2).any(|pair| pair == ["-map", "0:1"]));
-        assert!(!plain.contains(&"-af".to_owned()));
+        // A track starting after the file is padded to the seek point.
+        assert!(plain
+            .windows(2)
+            .any(|pair| pair == ["-af", "aresample=async=1:first_pts=0"]));
 
         let early = arguments(
             -0.25,
@@ -732,9 +764,11 @@ mod tests {
             },
         );
         assert!(early.windows(2).any(|pair| pair == ["-ss", "0.000000"]));
-        assert!(early
-            .windows(2)
-            .any(|pair| pair == ["-af", "adelay=delays=250.000:all=1,atempo=1.5"]));
+        assert!(early.windows(2).any(|pair| pair
+            == [
+                "-af",
+                "aresample=async=1:first_pts=0,adelay=delays=250.000:all=1,atempo=1.5"
+            ]));
     }
 
     #[test]
@@ -780,6 +814,58 @@ mod tests {
             .expect("source listening");
         assert_eq!(source.next(), None);
         assert_eq!(progress.end(), Some(StreamEnd::Finished));
+    }
+
+    #[test]
+    fn a_held_stream_is_not_read_until_its_sink_plays() {
+        let (sender, records) = bounded(4);
+        sender
+            .send(StreamItem::Record(vec![1; 64]))
+            .expect("source listening");
+        let progress = Arc::new(AudioStreamProgress::default());
+        let (sink, mut output) = Sink::new_idle();
+        queue_held(&sink, StreamedAudioSource::new(records, progress.clone()));
+
+        // The output device keeps pulling; a held sink hands it silence.
+        for _ in 0..AUDIO_SAMPLE_RATE {
+            assert_eq!(output.next(), Some(0.0));
+        }
+        assert_eq!(progress.played_samples(), None);
+
+        sink.play();
+        // Unpausing reaches the source at the sink's next periodic check.
+        let played = (0..AUDIO_SAMPLE_RATE as usize).any(|_| {
+            output.next();
+            progress.played_samples().is_some()
+        });
+        assert!(played);
+    }
+
+    #[test]
+    fn resumed_sound_waits_for_the_picture() {
+        let mut state = AudioPlaybackState::without_output();
+        let paused = entry(false, 3, true);
+        paused.stream.as_ref().expect("streaming").sink.pause();
+        state.entries.insert(1, paused);
+        let sink_paused = |state: &AudioPlaybackState| {
+            state.entries[&1]
+                .stream
+                .as_ref()
+                .expect("streaming")
+                .sink
+                .is_paused()
+        };
+
+        state.sync([AudioClockSample {
+            picture_ready: false,
+            ..sample(true, 3)
+        }]);
+        assert!(sink_paused(&state));
+        assert_eq!(state.clock(1, 3), AudioClock::Prerolling);
+
+        state.sync([sample(true, 3)]);
+        assert!(!sink_paused(&state));
+        assert!(!state.entries[&1].awaiting_picture);
     }
 
     #[test]

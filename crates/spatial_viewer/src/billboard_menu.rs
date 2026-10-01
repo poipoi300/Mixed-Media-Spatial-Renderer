@@ -1,14 +1,15 @@
-//! The right-click menu of a billboard.
+//! The right-click menu of a billboard, or of the empty space around them.
 //!
 //! A right press released before it turns into a look-drag is a right-click
-//! ([`WorldRightClick`]); on a video (its picture or its control strip) it
-//! opens this menu, which offers what the control strip does not: looping,
-//! speed, sound and subtitle tracks and their delays, the file's details,
-//! and a few file actions. Everything it changes is a per-file setting in
-//! [`MediaSettings`], so it applies whether or not the video is playing.
-//!
-//! The commands are [`BillboardMenuCommand`]s rather than video-only ones so
-//! images can get a menu of their own (sharing the file actions) later.
+//! ([`WorldRightClick`]). On a video (its picture or its control strip) it
+//! opens a menu offering what the control strip does not: looping, speed,
+//! sound and subtitle tracks and their delays, the file's details, and a few
+//! file actions. Everything that changes is a per-file setting in
+//! [`MediaSettings`], so it applies whether or not the video is playing. On
+//! an image it offers the file actions alone. Either can put the billboard
+//! in a new folder. On a folder it offers to rename, move or delete the
+//! folder and whether it shows its tag, and on empty space to make an empty
+//! folder there.
 
 use std::{
     path::{Path, PathBuf},
@@ -21,9 +22,12 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use spatial_viewer_ui::{
     ContextMenu, ContextMenuItem, ContextMenuModel, ContextMenuOption, ContextMenuSection,
-    PauseMenuState, RenderResolutionSettings,
+    FolderControls, PauseMenuState, RenderResolutionSettings,
 };
 
+use crate::arrangement_history::ArrangementHistory;
+use crate::folder_labels::FolderHandles;
+use crate::folders::{new_folder_center, Folder, FolderCommand, FolderKey};
 use crate::image_loading::MediaBillboard;
 use crate::manual_spacing::{cursor_world_ray, nearest_billboard_hit};
 use crate::media_decode::{still_frame_arguments, VideoSource};
@@ -61,10 +65,10 @@ pub(crate) enum BillboardMenuCommand {
     RevealInFileBrowser,
     OpenInDefaultApp,
     CopyPath,
+    Folder(FolderCommand),
 }
 
-/// The billboard the menu was last opened for; the commands it hands over
-/// act on it.
+/// What the menu was last opened on; the commands it hands over act on it.
 #[derive(Resource, Default)]
 pub(crate) struct BillboardMenuTarget(Option<MenuTarget>);
 
@@ -88,24 +92,33 @@ pub(crate) fn billboard_menu_systems() -> impl IntoSystemConfigs<()> {
 }
 
 #[derive(Clone)]
-struct MenuTarget {
-    image_id: usize,
-    path: Arc<str>,
+enum MenuTarget {
+    Billboard {
+        image_id: usize,
+        path: Arc<str>,
+        is_video: bool,
+    },
+    Folder(FolderKey),
+    Space,
 }
 
 impl BillboardMenuTarget {
     /// A target as a right-click on the video would set it.
     #[cfg(test)]
     pub(crate) fn video(image_id: usize, path: &str) -> Self {
-        Self(Some(MenuTarget {
+        Self(Some(MenuTarget::Billboard {
             image_id,
             path: path.into(),
+            is_video: true,
         }))
     }
 }
 
-/// Opens the menu of the video under a right-click: its control strip, or
-/// failing that the nearest picture under the pointer.
+/// Opens the menu of what is under a right-click: a folder, as a left press
+/// there would find it (its cube while closed, its name, badge or close
+/// icons at any time); else a video's control strip, failing that the
+/// nearest picture under the pointer, and failing that the empty space
+/// there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_billboard_menu(
     mut right_clicks: EventReader<WorldRightClick>,
@@ -115,6 +128,9 @@ pub(crate) fn open_billboard_menu(
     camera_query: Query<(&Camera, &GlobalTransform), With<FlyCamera>>,
     strip_parts: VideoStripHitQuery,
     billboards: Query<(&MediaBillboard, &GlobalTransform, &Visibility)>,
+    handles: Res<FolderHandles>,
+    history: Res<ArrangementHistory>,
+    folder_controls: Res<FolderControls>,
     mut probes: ResMut<MediaProbes>,
     media_settings: Res<MediaSettings>,
     mut target: ResMut<BillboardMenuTarget>,
@@ -150,32 +166,75 @@ pub(crate) fn open_billboard_menu(
     )
     .map(|hit| hit.image_id)
     .or(billboard_hit.map(|hit| hit.image_id));
-    let Some(billboard) = image_id.and_then(|image_id| {
+    let handle = handles
+        .hit(ray_origin, ray_direction)
+        .filter(|handle| billboard_hit.is_none_or(|hit| handle.distance < hit.distance));
+    let pressed_folder = match &handle {
+        Some(handle) => Some(&handle.key),
+        None => scene.folders.pressed_folder(
+            ray_origin,
+            ray_direction,
+            billboard_hit.map(|hit| (hit.image_id, hit.distance)),
+        ),
+    };
+    if let Some(folder) = pressed_folder.and_then(|key| scene.folders.get(key)) {
+        target.0 = Some(MenuTarget::Folder(folder.key.clone()));
+        menu.open(
+            cursor,
+            folder_menu_model(folder, folder_controls.display.tags),
+        );
+        return;
+    }
+    let billboard = image_id.and_then(|image_id| {
         billboards
             .iter()
             .map(|(billboard, _, _)| billboard)
-            .find(|billboard| billboard.image_id == image_id && billboard.is_video)
-    }) else {
+            .find(|billboard| billboard.image_id == image_id)
+    });
+    let Some(billboard) = billboard else {
+        let shown_positions = billboards
+            .iter()
+            .filter(|(_, _, visibility)| **visibility != Visibility::Hidden)
+            .map(|(_, transform, _)| transform.translation());
+        let folder_center = new_folder_center(
+            ray_origin,
+            ray_direction,
+            shown_positions,
+            scene.billboard_world_size,
+        );
+        target.0 = Some(MenuTarget::Space);
+        menu.open(
+            cursor,
+            space_menu_model(folder_center, history.can_undo(), history.can_redo()),
+        );
         return;
     };
     let path = billboard.path.clone();
-    probes.request(Path::new(&*path));
-    let model = video_menu_model(
-        &path,
-        probes.get(Path::new(&*path)),
-        &media_settings.video(&path),
-    );
-    target.0 = Some(MenuTarget {
+    let model = if billboard.is_video {
+        probes.request(Path::new(&*path));
+        video_menu_model(
+            billboard.image_id,
+            &path,
+            probes.get(Path::new(&*path)),
+            &media_settings.video(&path),
+        )
+    } else {
+        image_menu_model(billboard.image_id, &path)
+    };
+    target.0 = Some(MenuTarget::Billboard {
         image_id: billboard.image_id,
         path,
+        is_video: billboard.is_video,
     });
     menu.open(cursor, model);
 }
 
 /// Keeps the open menu showing its video's current settings and tracks, and
-/// closes it once the video unloads or the pause menu opens.
+/// closes it once its billboard unloads, its folder is gone, or the pause
+/// menu opens.
 pub(crate) fn refresh_billboard_menu(
     pause_menu: Res<PauseMenuState>,
+    scene: Res<ExplorerScene>,
     probes: Res<MediaProbes>,
     media_settings: Res<MediaSettings>,
     billboards: Query<&MediaBillboard>,
@@ -189,20 +248,46 @@ pub(crate) fn refresh_billboard_menu(
         menu.close();
         return;
     };
-    let loaded = billboards
-        .iter()
-        .any(|billboard| billboard.image_id == current.image_id && billboard.path == current.path);
-    if !loaded || pause_menu.paused {
+    if pause_menu.paused {
         menu.close();
         return;
     }
-    menu.update(video_menu_model(
-        &current.path,
-        probes.get(Path::new(&*current.path)),
-        &media_settings.video(&current.path),
-    ));
+    let (image_id, path, is_video) = match current {
+        MenuTarget::Billboard {
+            image_id,
+            path,
+            is_video,
+        } => (image_id, path, is_video),
+        MenuTarget::Folder(folder) => {
+            if scene
+                .folders
+                .get(folder)
+                .is_none_or(|folder| !folder.visible)
+            {
+                menu.close();
+            }
+            return;
+        }
+        MenuTarget::Space => return,
+    };
+    let loaded = billboards
+        .iter()
+        .any(|billboard| billboard.image_id == *image_id && billboard.path == *path);
+    if !loaded {
+        menu.close();
+        return;
+    }
+    if *is_video {
+        menu.update(video_menu_model(
+            *image_id,
+            path,
+            probes.get(Path::new(&**path)),
+            &media_settings.video(path),
+        ));
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_billboard_menu_commands(
     controls: Res<VideoControlsState>,
     video_playback: Res<VideoPlaybackState>,
@@ -211,13 +296,17 @@ pub(crate) fn apply_billboard_menu_commands(
     mut clipboard: NonSendMut<ClipboardHandle>,
     target: Res<BillboardMenuTarget>,
     mut menu: ResMut<ContextMenu<BillboardMenuCommand>>,
+    mut folder_commands: EventWriter<FolderCommand>,
 ) {
-    let commands = menu.take_activated();
-    let Some(target) = target.0.as_ref() else {
-        return;
-    };
-    for command in commands {
-        let path = &target.path;
+    for command in menu.take_activated() {
+        // Folder commands name what they act on themselves.
+        if let BillboardMenuCommand::Folder(folder_command) = command {
+            folder_commands.send(folder_command);
+            continue;
+        }
+        let Some(MenuTarget::Billboard { image_id, path, .. }) = target.0.as_ref() else {
+            continue;
+        };
         let shift_delay =
             |delay_ms: i32, step_ms: i32| (delay_ms + step_ms).clamp(-MAX_DELAY_MS, MAX_DELAY_MS);
         match command {
@@ -256,12 +345,8 @@ pub(crate) fn apply_billboard_menu_commands(
                 // The frame on screen, not the clock's exact time, which
                 // is usually part way to the next frame.
                 let time_seconds = video_playback
-                    .shown_frame_seek_seconds(target.image_id)
-                    .or_else(|| {
-                        controls
-                            .clock(target.image_id)
-                            .map(|clock| clock.time_seconds())
-                    })
+                    .shown_frame_seek_seconds(*image_id)
+                    .or_else(|| controls.clock(*image_id).map(|clock| clock.time_seconds()))
                     .unwrap_or(0.0);
                 let info = probes.info(Path::new(&**path));
                 let source = VideoSource {
@@ -276,12 +361,149 @@ pub(crate) fn apply_billboard_menu_commands(
             BillboardMenuCommand::RevealInFileBrowser => reveal_in_file_browser(path),
             BillboardMenuCommand::OpenInDefaultApp => open_in_default_app(path),
             BillboardMenuCommand::CopyPath => clipboard.copy(path),
+            // Sent before a billboard target was required.
+            BillboardMenuCommand::Folder(_) => {}
         }
     }
 }
 
+/// The menu of an image in file `path`.
+fn image_menu_model(image_id: usize, path: &str) -> ContextMenuModel<BillboardMenuCommand> {
+    ContextMenuModel {
+        title: file_name(path),
+        sections: vec![
+            folder_section(image_id),
+            ContextMenuSection {
+                heading: Some("File".to_owned()),
+                items: file_actions().collect(),
+            },
+        ],
+    }
+}
+
+/// The menu of empty space, where a folder made from it stands at
+/// `folder_center`, with undo and redo while there is something to undo or
+/// redo.
+fn space_menu_model(
+    folder_center: Vec3,
+    can_undo: bool,
+    can_redo: bool,
+) -> ContextMenuModel<BillboardMenuCommand> {
+    let action = |label: &str, command: FolderCommand| ContextMenuItem::Action {
+        label: label.to_owned(),
+        command: BillboardMenuCommand::Folder(command),
+    };
+    let mut items = vec![action(
+        "Create folder",
+        FolderCommand::Create {
+            center: folder_center,
+        },
+    )];
+    if can_undo {
+        items.push(action("Undo", FolderCommand::Undo));
+    }
+    if can_redo {
+        items.push(action("Redo", FolderCommand::Redo));
+    }
+    ContextMenuModel {
+        title: "Empty space".to_owned(),
+        sections: vec![ContextMenuSection {
+            heading: None,
+            items,
+        }],
+    }
+}
+
+/// The menu of a folder, where folders show their tags unless they say
+/// otherwise while `show_tags`.
+fn folder_menu_model(folder: &Folder, show_tags: bool) -> ContextMenuModel<BillboardMenuCommand> {
+    let command = |label: &str, command: FolderCommand| ContextMenuItem::Action {
+        label: label.to_owned(),
+        command: BillboardMenuCommand::Folder(command),
+    };
+    let tag_label = |shown: Option<bool>| match shown {
+        None if show_tags => "As all folders (shown)",
+        None => "As all folders (hidden)",
+        Some(true) => "Shown",
+        Some(false) => "Hidden",
+    };
+    let tag = ContextMenuItem::Choice {
+        label: "Tag".to_owned(),
+        value: tag_label(folder.tag_override).to_owned(),
+        options: [None, Some(true), Some(false)]
+            .into_iter()
+            .map(|shown| ContextMenuOption {
+                label: tag_label(shown).to_owned(),
+                selected: folder.tag_override == shown,
+                command: Some(BillboardMenuCommand::Folder(FolderCommand::SetTagShown {
+                    folder: folder.key.clone(),
+                    shown,
+                })),
+            })
+            .collect(),
+    };
+    ContextMenuModel {
+        title: folder.name(),
+        sections: vec![ContextMenuSection {
+            heading: None,
+            items: vec![
+                command(
+                    "Rename folder",
+                    FolderCommand::Rename {
+                        folder: folder.key.clone(),
+                    },
+                ),
+                command(
+                    "Move folder",
+                    FolderCommand::Move {
+                        folder: folder.key.clone(),
+                    },
+                ),
+                command(
+                    "Delete folder",
+                    FolderCommand::Delete {
+                        folder: folder.key.clone(),
+                    },
+                ),
+                tag,
+            ],
+        }],
+    }
+}
+
+fn folder_section(image_id: usize) -> ContextMenuSection<BillboardMenuCommand> {
+    ContextMenuSection {
+        heading: Some("Folder".to_owned()),
+        items: vec![ContextMenuItem::Action {
+            label: "Add to new folder".to_owned(),
+            command: BillboardMenuCommand::Folder(FolderCommand::AddToNew { image_id }),
+        }],
+    }
+}
+
+/// What any billboard's file offers.
+fn file_actions() -> impl Iterator<Item = ContextMenuItem<BillboardMenuCommand>> {
+    [
+        (
+            "Show in file browser",
+            BillboardMenuCommand::RevealInFileBrowser,
+        ),
+        (
+            "Open in default app",
+            BillboardMenuCommand::OpenInDefaultApp,
+        ),
+        ("Copy path", BillboardMenuCommand::CopyPath),
+    ]
+    .into_iter()
+    .map(|(label, command)| ContextMenuItem::Action {
+        label: label.to_owned(),
+        command,
+    })
+}
+
 /// The menu of the video in file `path`.
 fn video_menu_model(
+    image_id: usize,
     path: &str,
     probe: Option<&MediaProbe>,
     settings: &VideoFileSettings,
@@ -344,24 +566,12 @@ fn video_menu_model(
         },
     ];
     let mut file_items = info.map(file_details).unwrap_or_default();
-    file_items.extend(
-        [
-            ("Save frame as PNG", BillboardMenuCommand::SaveFrame),
-            (
-                "Show in file browser",
-                BillboardMenuCommand::RevealInFileBrowser,
-            ),
-            (
-                "Open in default app",
-                BillboardMenuCommand::OpenInDefaultApp,
-            ),
-            ("Copy path", BillboardMenuCommand::CopyPath),
-        ]
-        .map(|(label, command)| ContextMenuItem::Action {
-            label: label.to_owned(),
-            command,
-        }),
-    );
+    file_items.push(ContextMenuItem::Action {
+        label: "Save frame as PNG".to_owned(),
+        command: BillboardMenuCommand::SaveFrame,
+    });
+    file_items.extend(file_actions());
+    sections.push(folder_section(image_id));
     sections.push(ContextMenuSection {
         heading: Some("File".to_owned()),
         items: file_items,
@@ -694,6 +904,7 @@ mod tests {
     #[test]
     fn the_menu_marks_what_plays_and_dims_what_cannot() {
         let model = video_menu_model(
+            0,
             r"E:\a\ep.mkv",
             Some(&probe()),
             &VideoFileSettings::default(),
@@ -718,6 +929,7 @@ mod tests {
     #[test]
     fn until_the_file_is_read_tracks_show_a_note() {
         let model = video_menu_model(
+            0,
             "ep.mkv",
             Some(&MediaProbe::Pending),
             &VideoFileSettings::default(),
@@ -737,7 +949,7 @@ mod tests {
             audio_tracks: Vec::new(),
             ..(*info).clone()
         }));
-        let model = video_menu_model("ep.mkv", Some(&silent), &VideoFileSettings::default());
+        let model = video_menu_model(0, "ep.mkv", Some(&silent), &VideoFileSettings::default());
         assert!(matches!(
             &section(&model, "Audio")[0],
             ContextMenuItem::Info { value, .. } if value == "None in this file"
@@ -748,7 +960,7 @@ mod tests {
     fn a_delay_offers_its_reset_only_once_moved() {
         let mut settings = VideoFileSettings::default();
         let delay_reset = |settings: &VideoFileSettings| {
-            let model = video_menu_model("ep.mkv", Some(&probe()), settings);
+            let model = video_menu_model(0, "ep.mkv", Some(&probe()), settings);
             match &section(&model, "Audio")[1] {
                 ContextMenuItem::Stepper { value, reset, .. } => (value.clone(), reset.clone()),
                 _ => panic!("delay is a stepper"),

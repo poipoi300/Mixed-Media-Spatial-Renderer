@@ -129,9 +129,129 @@ coordinate labels are rasterized lazily only while their display option is enabl
 
 ## Layout
 
-Projection coordinates are laid out with image width/height metadata: coordinate
-slots grow when an image footprint needs more room, and duplicate records at the
-same coordinate are packed into an extent-aware 3D grid.
+A server places every image in a unit cube and lays the cubes out touching, and
+may name each image's group. The viewer lays the groups out itself, on a grid of
+touching slots (`SlotGrid` in `spatial_geometry`) where each slot is as wide as
+the widest thing it shows: one cube for a closed folder or a single image, the
+whole block plus a margin for an open folder. Only what is shown becomes a point,
+so a closed folder's hidden images are never loaded.
+
+Opening or closing a folder re-lays out the loaded scene off-thread, with no
+server round trip, and shifts the whole layout so the toggled folder (through the
+outermost folder around it) stays put while its neighbours move. Moved billboards
+and folder cubes spring to their new places; images a closing folder hides fly
+back into it; images an opening folder reveals fly out of it as their textures
+load, and their placeholders wait for the cube to grow around them.
+
+What the user arranges by hand is kept apart from what the server sent: where
+each dropped image or folder went (loose in world space, or at an offset inside
+a folder), the folders they made, named and deleted. Every layout applies it on
+top of the server's groups, so it survives relayouts and streamed snapshots. A
+folder moved out of its slot stops taking room on the grid. Folders nest, and a
+nested folder shows only while every folder around it is open.
+
+Each change to the arrangement that settles while no drag is under way is one
+undo step, so a whole drag undoes at once; opening and closing folders
+arranges nothing and is not undone. The arrangement is also kept per view (a
+catalog's roots plus the server's control values) in a JSON file in the
+per-user state directory. Images are kept there by path, since the ids a
+server hands out last only one load, and loose positions relative to the
+layout's origin, where a load starts; a saved placement applies to its image
+whenever a snapshot brings it, and a new placement by id replaces it. The
+same file keeps, per view, where the camera was left (relative to that
+origin, with its direction and base speed), taken whenever the camera has
+held still for a frame while the setting is on; a load of the view places
+the camera there instead of at the initial view, once its first snapshot
+arrives.
+
+Everything in a folder, image or folder, takes a cell of the folder's own grid,
+and the cells pack like the scene's slots: each row, column and layer is as
+wide as the widest thing in it, so a folder opening inside another pushes its
+neighbours aside rather than covering them. The block is centered on the
+folder, and the folder just opened or closed stays where it was. Something
+dropped into a folder takes the cell under it, or the nearest free one.
+
+Every animation reads `AnimationSettings`, which the pause menu edits: each
+can be switched off, and all advance by real time divided by one duration
+scale. Springs step at most 1/30 s at a time, however far a frame advances
+them, so they stay stable at any scale. A billboard's scale is its layout's
+scale times its hover growth (`BillboardGrowth`), and the two spring apart,
+so growth can animate while rearranging jumps, or the other way round. An
+animation switched off lands on its end state the same frame: billboards and
+cubes take their targets, retiring images vanish, placeholders show at once
+and a camera flight ends where it would have.
+
+A folder's cube draws only its far faces, from the inside, so no wall stands
+between the viewer and what the folder holds. An open folder's walls are a
+backdrop besides: their fragments sit at the far plane, so they show only where
+nothing else was drawn, and no open folder the view looks through or stands in
+hides anything. Blended meshes sort by their origin alone, which the images
+inside share with the cube, so each wall material carries a sort bias that
+draws the walls first.
+
+Clicks go to what the viewer sees: pictures and closed folders take them
+through any open folder in front, and an open folder takes none itself. A
+closed folder's previews are pictures inside its cube: the ray enters the
+cube first, but a preview it reaches takes the click, and the cube takes
+only what misses them. Hovering resolves the same way, so what grows under
+the pointer is what a click would take: an image, or a closed folder's cube
+(by its own growth factor, kept apart from its layout size like a
+billboard's). Each
+folder has handles instead, camera-facing quads that follow its cube as it
+springs: a tag (a count badge and the folder's name; a click selects the
+folder without toggling it) hanging from the corner the view sees lowest and
+leftmost, and while it
+is open a close icon on the corner it sees highest and rightmost, sized by
+distance so it reads alike near and far. Among the corners in front of the
+camera, those are the ones whose projections reach furthest that way, so the
+handles follow the camera round the cube. A folder's own name is the value of
+each axis everything in it shares, each in the axis's gizmo color, as are the
+lines of a billboard's coordinates. Whether folders show their tags, their
+close icons and their cubes' walls is kept with the arrangements, and a
+folder may override the first for itself (kept with its view's arrangement).
+A handle that does not show takes no press. A cube without walls is hidden
+unless it is selected or a drop target, but it still springs, grows under
+the pointer and takes presses, since those come from the folder's layout, not
+its mesh. Only folders near the camera get tags, a
+few more each frame, so a scene of thousands of folders pays for the ones the
+user can read.
+
+A video's control strip is laid out in screen space over the part of its
+picture on screen, so it moves whenever the view or the picture does. With
+that switched off (an animation, as far as the settings go), the strip is
+laid out once as if the picture showed at a fixed size, and fixed on the
+picture: it moves, turns and scales with the picture alone.
+
+## Controls
+
+Every control the viewer answers to is an `Action` in one table
+(`spatial_viewer_ui::input_bindings`) that carries its category, description
+and default binding; an action that uses another's input with a different
+gesture (a drag of the button that selects on a click) names that action. The
+viewer reads input only as actions, and a test fails if any source reads a key
+or mouse button directly, so the controls sheet, which lists the table, cannot
+fall out of step with what the keys do. Keys stand down while text is being
+typed, except the key that ends the typing.
+
+Each action that owns its binding has two slots, each holding a chord: an
+input, the modifiers held with it (either side of `Ctrl`, `Shift`, `Alt`),
+and whether it is double-tapped. When a press matches chords on the same
+input, the one with the most modifiers, all held, takes it, so `Ctrl+Shift+Z`
+redoes without also undoing; and a second tap goes to a double-tap on the
+same chord alone, so the second `F` fits everything without fitting the
+selection again. Actions that only change what another does while held
+(moving faster, stepping through depth) never take a press this way: they
+add to it. A held action can toggle instead; its on state
+is kept frame to frame, with the taps a double-tap needs. The controls sheet
+rebinds a slot by capturing the next input (`Esc` cancels, `Backspace`
+empties the slot; a press waits the double-tap window for a second one), and
+nothing else reads input meanwhile. It flags conflicts: two actions read at
+the same time on one chord, unless both only change what another action does
+while held (moving faster, stepping through depth), which may share a key.
+The pause-menu action always keeps a binding. Only how the bindings differ
+from the defaults is saved, as action and chord names in `controls.json` in
+the per-user state directory, so a later viewer's new defaults still reach
+every control the user has not changed.
 
 
 ## Window and movement

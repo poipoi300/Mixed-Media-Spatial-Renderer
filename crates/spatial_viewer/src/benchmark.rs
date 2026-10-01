@@ -602,7 +602,7 @@ fn finish_run(
         "schema": "spatial_viewer.benchmark/1",
         "catalog": {
             "projected_points": scene.projection.points.len(),
-            "coordinate_spacing": scene.coordinate_spacing,
+            "cube_size": scene.billboard_world_size,
             "texture_budget_mib": controls.texture_budget_mib,
             "max_texture_side": controls.max_texture_side,
             "reference_distance": navigation.reference_distance,

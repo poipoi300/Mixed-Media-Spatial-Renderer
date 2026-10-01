@@ -1,7 +1,7 @@
 //! Everything the viewer remembers about how to play a file — volume, mute,
 //! the chosen sound and subtitle tracks, their delays, speed, looping and
-//! where playback was left — plus the app-wide playback settings, kept in one
-//! JSON file in the per-user state directory.
+//! where playback was left — plus the app-wide playback and animation
+//! settings, kept in one JSON file in the per-user state directory.
 //!
 //! Settings are keyed by file path, so they follow a file wherever a catalog
 //! puts it. A file whose settings are all defaults has no entry. Changes are
@@ -21,7 +21,9 @@ use std::{
 
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
-use spatial_viewer_ui::{AudioSettings, PlaybackSettings};
+use spatial_viewer_ui::{
+    Animation, AnimationSettings, AudioSettings, PlaybackSettings, ViewSettings,
+};
 
 use crate::catalog_session::user_state_directory;
 use crate::media_decode::SubtitleBurn;
@@ -160,6 +162,15 @@ impl VideoFileSettings {
         self.audio_delay_ms as f32 / 1000.0
     }
 
+    /// Where the video opens when it starts: where it was left while the app
+    /// remembers positions, else at its start.
+    pub fn opening_seconds(&self, remember_position: bool) -> f32 {
+        remember_position
+            .then_some(self.resume_seconds)
+            .flatten()
+            .unwrap_or(0.0)
+    }
+
     /// Everything but the remembered position back to defaults.
     pub fn reset_playback(&mut self) {
         *self = Self {
@@ -184,7 +195,9 @@ pub fn volume_gain(volume: f32) -> f32 {
 #[serde(default)]
 struct SettingsFile {
     remember_playback_position: bool,
+    remember_camera_position: bool,
     master_volume: f32,
+    animations: SavedAnimations,
     videos: BTreeMap<String, VideoFileSettings>,
 }
 
@@ -192,26 +205,76 @@ impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             remember_playback_position: PlaybackSettings::default().remember_position,
+            remember_camera_position: ViewSettings::default().remember_camera,
             master_volume: AudioSettings::default().volume(),
+            animations: SavedAnimations::of(&AnimationSettings::default()),
             videos: BTreeMap::new(),
         }
     }
 }
 
+/// [`AnimationSettings`] as the file holds them: the animations switched
+/// off by name, so a name a later viewer no longer knows is skipped.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedAnimations {
+    disabled: bool,
+    duration_scale: f32,
+    turned_off: Vec<String>,
+}
+
+impl Default for SavedAnimations {
+    fn default() -> Self {
+        Self::of(&AnimationSettings::default())
+    }
+}
+
+impl SavedAnimations {
+    fn of(settings: &AnimationSettings) -> Self {
+        Self {
+            disabled: settings.all_disabled,
+            duration_scale: settings.duration_scale(),
+            turned_off: settings
+                .turned_off()
+                .map(|animation| animation.key().to_owned())
+                .collect(),
+        }
+    }
+
+    fn settings(&self) -> AnimationSettings {
+        AnimationSettings::new(
+            self.disabled,
+            self.duration_scale,
+            self.turned_off
+                .iter()
+                .filter_map(|key| Animation::from_key(key)),
+        )
+    }
+}
+
 /// The app-wide settings saved alongside the per-file ones. They live in
-/// the UI's [`PlaybackSettings`] and [`AudioSettings`], and are read from
-/// there when saving.
-#[derive(Clone, Copy)]
+/// the UI's [`PlaybackSettings`], [`AudioSettings`], [`AnimationSettings`]
+/// and [`ViewSettings`], and are read from there when saving.
+#[derive(Clone)]
 struct AppSettings {
     remember_playback_position: bool,
+    remember_camera_position: bool,
     master_volume: f32,
+    animations: SavedAnimations,
 }
 
 impl AppSettings {
-    fn of(playback: &PlaybackSettings, audio: &AudioSettings) -> Self {
+    fn of(
+        playback: &PlaybackSettings,
+        audio: &AudioSettings,
+        animations: &AnimationSettings,
+        view: &ViewSettings,
+    ) -> Self {
         Self {
             remember_playback_position: playback.remember_position,
+            remember_camera_position: view.remember_camera,
             master_volume: audio.volume(),
+            animations: SavedAnimations::of(animations),
         }
     }
 }
@@ -221,6 +284,8 @@ pub struct LoadedSettings {
     pub media: MediaSettings,
     pub playback: PlaybackSettings,
     pub audio: AudioSettings,
+    pub animations: AnimationSettings,
+    pub view: ViewSettings,
 }
 
 #[derive(Resource)]
@@ -240,7 +305,7 @@ impl MediaSettings {
     pub fn load() -> LoadedSettings {
         let file = user_state_directory().map(|directory| directory.join(SETTINGS_FILE_NAME));
         let (saved, file) = match file {
-            Some(file) => match read_settings(&file) {
+            Some(file) => match read_state_file(&file, "media settings") {
                 Ok(saved) => (saved.unwrap_or_default(), Some(file)),
                 // Saving would overwrite whatever could not be read.
                 Err(()) => (SettingsFile::default(), None),
@@ -252,6 +317,10 @@ impl MediaSettings {
                 remember_position: saved.remember_playback_position,
             },
             audio: AudioSettings::with_volume(saved.master_volume),
+            animations: saved.animations.settings(),
+            view: ViewSettings {
+                remember_camera: saved.remember_camera_position,
+            },
             media: Self::from_file(saved, file),
         }
     }
@@ -271,7 +340,7 @@ impl MediaSettings {
                 .collect(),
             file,
             unsaved_since: None,
-            writer: SettingsWriter::default(),
+            writer: SettingsWriter::new("media settings"),
         }
     }
 
@@ -303,7 +372,9 @@ impl MediaSettings {
     fn snapshot(&self, app: AppSettings) -> SettingsFile {
         SettingsFile {
             remember_playback_position: app.remember_playback_position,
+            remember_camera_position: app.remember_camera_position,
             master_volume: app.master_volume,
+            animations: app.animations,
             videos: self
                 .videos
                 .iter()
@@ -313,8 +384,8 @@ impl MediaSettings {
     }
 
     /// Writes the settings on a background thread once they have been
-    /// unsaved for `SAVE_DELAY`.
-    fn save_when_due(&mut self, app: AppSettings) {
+    /// unsaved for `SAVE_DELAY`, taking the app-wide ones from `app` then.
+    fn save_when_due(&mut self, app: impl FnOnce() -> AppSettings) {
         if self.writer.take_failure() {
             self.mark_changed();
         }
@@ -322,7 +393,7 @@ impl MediaSettings {
             .unsaved_since
             .is_some_and(|since| since.elapsed() >= SAVE_DELAY)
         {
-            self.save(app, false);
+            self.save(app(), false);
         }
     }
 
@@ -349,16 +420,20 @@ impl MediaSettings {
     }
 }
 
-/// The settings in `file`: `Ok(None)` when there are none yet, and `Err`
-/// when some are there but cannot be read and are still in the way. A file
-/// that reads but does not parse is moved aside, so saving does not lose it.
-fn read_settings(file: &Path) -> Result<Option<SettingsFile>, ()> {
+/// The state saved in `file` (`what` names it in messages): `Ok(None)` when
+/// there is none yet, and `Err` when some is there but cannot be read and is
+/// still in the way. A file that reads but does not parse is moved aside,
+/// so saving does not lose it.
+pub(crate) fn read_state_file<T: serde::de::DeserializeOwned>(
+    file: &Path,
+    what: &str,
+) -> Result<Option<T>, ()> {
     let contents = match fs::read_to_string(file) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             eprintln!(
-                "Cannot read media settings ({error}); leaving {} alone this session",
+                "Cannot read {what} ({error}); leaving {} alone this session",
                 file.display()
             );
             return Err(());
@@ -369,13 +444,13 @@ fn read_settings(file: &Path) -> Result<Option<SettingsFile>, ()> {
         Err(error) => {
             let aside = file.with_extension("json.unreadable");
             eprintln!(
-                "Media settings are unreadable ({error}); moving them to {}",
+                "The {what} are unreadable ({error}); moving them to {}",
                 aside.display()
             );
             match fs::rename(file, &aside) {
                 Ok(()) => Ok(None),
                 Err(error) => {
-                    eprintln!("Failed to move the unreadable media settings: {error}");
+                    eprintln!("Failed to move the unreadable {what}: {error}");
                     Err(())
                 }
             }
@@ -386,8 +461,10 @@ fn read_settings(file: &Path) -> Result<Option<SettingsFile>, ()> {
 /// Orders the settings writes: each takes a sequence number, and a write
 /// that finds a later one already on disk is dropped, so a slow background
 /// write can never replace newer settings (such as the ones written on exit).
-#[derive(Clone, Default)]
-struct SettingsWriter {
+#[derive(Clone)]
+pub(crate) struct SettingsWriter {
+    /// Names what is written, in messages.
+    what: &'static str,
     next_sequence: u64,
     written_sequence: Arc<Mutex<u64>>,
     /// Set by a write that failed, so the settings are saved again.
@@ -395,11 +472,21 @@ struct SettingsWriter {
 }
 
 impl SettingsWriter {
-    fn write(&mut self, file: PathBuf, contents: String, blocking: bool) {
+    pub(crate) fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            next_sequence: 0,
+            written_sequence: Arc::default(),
+            failed: Arc::default(),
+        }
+    }
+
+    pub(crate) fn write(&mut self, file: PathBuf, contents: String, blocking: bool) {
         self.next_sequence += 1;
         let sequence = self.next_sequence;
         let written_sequence = self.written_sequence.clone();
         let failed = self.failed.clone();
+        let what = self.what;
         let write = move || {
             let Ok(mut written) = written_sequence.lock() else {
                 return;
@@ -410,7 +497,7 @@ impl SettingsWriter {
             match write_replacing(&file, &contents) {
                 Ok(()) => *written = sequence,
                 Err(error) => {
-                    eprintln!("Failed to save media settings: {error}");
+                    eprintln!("Failed to save {what}: {error}");
                     failed.store(true, Ordering::Relaxed);
                 }
             }
@@ -422,7 +509,7 @@ impl SettingsWriter {
         }
     }
 
-    fn take_failure(&self) -> bool {
+    pub(crate) fn take_failure(&self) -> bool {
         self.failed.swap(false, Ordering::Relaxed)
     }
 }
@@ -443,15 +530,29 @@ fn write_replacing(file: &Path, contents: &str) -> std::io::Result<()> {
 pub fn save_media_settings(
     playback_settings: Res<PlaybackSettings>,
     audio_settings: Res<AudioSettings>,
+    animation_settings: Res<AnimationSettings>,
+    view_settings: Res<ViewSettings>,
     mut media_settings: ResMut<MediaSettings>,
 ) {
     let edited = |changed: bool, added: bool| changed && !added;
     if edited(playback_settings.is_changed(), playback_settings.is_added())
         || edited(audio_settings.is_changed(), audio_settings.is_added())
+        || edited(
+            animation_settings.is_changed(),
+            animation_settings.is_added(),
+        )
+        || edited(view_settings.is_changed(), view_settings.is_added())
     {
         media_settings.mark_changed();
     }
-    media_settings.save_when_due(AppSettings::of(&playback_settings, &audio_settings));
+    media_settings.save_when_due(|| {
+        AppSettings::of(
+            &playback_settings,
+            &audio_settings,
+            &animation_settings,
+            &view_settings,
+        )
+    });
 }
 
 /// Writes whatever is unsaved before the app closes. Runs after whatever
@@ -460,10 +561,20 @@ pub fn save_media_settings_on_exit(
     mut exit: EventReader<AppExit>,
     playback_settings: Res<PlaybackSettings>,
     audio_settings: Res<AudioSettings>,
+    animation_settings: Res<AnimationSettings>,
+    view_settings: Res<ViewSettings>,
     mut media_settings: ResMut<MediaSettings>,
 ) {
     if exit.read().count() > 0 {
-        media_settings.save(AppSettings::of(&playback_settings, &audio_settings), true);
+        media_settings.save(
+            AppSettings::of(
+                &playback_settings,
+                &audio_settings,
+                &animation_settings,
+                &view_settings,
+            ),
+            true,
+        );
     }
 }
 
@@ -531,14 +642,20 @@ mod tests {
             video.audio_delay_ms = -150;
             video.resume_seconds = Some(312.5);
         });
+        let mut animations = AnimationSettings::new(true, 2.0, []);
+        animations.toggle(Animation::CameraFlights);
         let app = AppSettings {
             remember_playback_position: false,
+            remember_camera_position: false,
             master_volume: 0.4,
+            animations: SavedAnimations::of(&animations),
         };
         let encoded = serde_json::to_string(&settings.snapshot(app)).expect("encodes");
         let decoded: SettingsFile = serde_json::from_str(&encoded).expect("decodes");
         assert!(!decoded.remember_playback_position);
+        assert!(!decoded.remember_camera_position);
         assert_eq!(decoded.master_volume, 0.4);
+        assert_eq!(decoded.animations.settings(), animations);
         let reloaded = MediaSettings::from_file(decoded, None);
         assert_eq!(reloaded.video(&path), settings.video(&path));
 
@@ -546,6 +663,8 @@ mod tests {
         let old: SettingsFile =
             serde_json::from_str(r#"{"videos": {"a.mp4": {"volume": 0.5}}}"#).expect("decodes");
         assert!(old.remember_playback_position);
+        assert!(old.remember_camera_position);
+        assert_eq!(old.animations.settings(), AnimationSettings::default());
         let old = MediaSettings::from_file(old, None);
         assert_eq!(old.video("a.mp4").volume, 0.5);
         assert!(old.video("a.mp4").looping);
@@ -559,7 +678,12 @@ mod tests {
         let mut settings = MediaSettings::from_file(SettingsFile::default(), Some(file.clone()));
         let path: Arc<str> = "clip.mp4".into();
         settings.update(&path, |video| video.looping = false);
-        let app = AppSettings::of(&PlaybackSettings::default(), &AudioSettings::default());
+        let app = AppSettings::of(
+            &PlaybackSettings::default(),
+            &AudioSettings::default(),
+            &AnimationSettings::default(),
+            &ViewSettings::default(),
+        );
         settings.save(app, true);
         assert!(settings.unsaved_since.is_none());
 
@@ -575,7 +699,7 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("media_settings_test_{}", std::process::id()));
         let file = directory.join(SETTINGS_FILE_NAME);
-        let mut writer = SettingsWriter::default();
+        let mut writer = SettingsWriter::new("media settings");
         writer.write(file.clone(), "first".to_owned(), true);
         writer.write(file.clone(), "second".to_owned(), true);
         // A write numbered before the one on disk arrives late.
@@ -598,8 +722,13 @@ mod tests {
         let mut settings = MediaSettings::from_file(SettingsFile::default(), Some(file));
         let path: Arc<str> = "clip.mp4".into();
         settings.update(&path, |video| video.speed = 2.0);
-        let app = AppSettings::of(&PlaybackSettings::default(), &AudioSettings::default());
-        settings.save(app, true);
+        let app = AppSettings::of(
+            &PlaybackSettings::default(),
+            &AudioSettings::default(),
+            &AnimationSettings::default(),
+            &ViewSettings::default(),
+        );
+        settings.save(app.clone(), true);
         assert!(settings.unsaved_since.is_none());
         // The next save sees the failure and tries again.
         settings.save(app, true);

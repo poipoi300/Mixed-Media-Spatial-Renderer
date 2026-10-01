@@ -4570,7 +4570,6 @@ name = "spatial_geometry"
 version = "0.1.0"
 dependencies = [
  "bevy_math",
- "spatial_api",
 ]
 
 [[package]]

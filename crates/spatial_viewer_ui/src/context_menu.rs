@@ -19,7 +19,10 @@ use bevy::transform::TransformSystem;
 use bevy::ui::{FocusPolicy, UiSystem};
 use bevy::window::PrimaryWindow;
 
-use crate::{button_color, header_button_color, update_ui_input_capture, UiInputCapture};
+use crate::{
+    button_color, header_button_color, update_ui_input_capture, Action, ControlBindings,
+    ControlInput, ControlInputState, TypingFocus, UiInputCapture,
+};
 
 const MENU_WIDTH: f32 = 300.0;
 const SUBMENU_WIDTH: f32 = 280.0;
@@ -224,7 +227,11 @@ impl<C> Default for ContextMenuPlugin<C> {
 
 impl<C: Clone + PartialEq + Send + Sync + 'static> Plugin for ContextMenuPlugin<C> {
     fn build(&self, app: &mut App) {
+        // The pause key closes the menu, read through the bindings.
         app.init_resource::<ContextMenu<C>>()
+            .init_resource::<ControlBindings>()
+            .init_resource::<ControlInputState>()
+            .init_resource::<TypingFocus>()
             .configure_sets(
                 Update,
                 ContextMenuSystems::Input.before(ContextMenuSystems::Render),
@@ -320,7 +327,7 @@ type ButtonQuery<'w, 's, C> =
 
 fn handle_context_menu_input<C: Clone + PartialEq + Send + Sync + 'static>(
     mut menu: ResMut<ContextMenu<C>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
+    input: ControlInput,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     rows: RowQuery<C>,
     buttons: ButtonQuery<C>,
@@ -329,7 +336,7 @@ fn handle_context_menu_input<C: Clone + PartialEq + Send + Sync + 'static>(
     if !menu.is_open() {
         return;
     }
-    if keyboard.just_pressed(KeyCode::Escape) {
+    if input.just_pressed(Action::PauseMenu) {
         menu.close();
         return;
     }

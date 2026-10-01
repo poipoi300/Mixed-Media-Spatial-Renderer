@@ -18,7 +18,10 @@ use bevy::math::primitives::Rectangle;
 use bevy::prelude::*;
 use bevy::render::{mesh::PrimitiveTopology, render_asset::RenderAssetUsages};
 use bevy::window::PrimaryWindow;
-use spatial_viewer_ui::{PauseMenuState, RenderResolutionSettings, UiInputCapture};
+use spatial_viewer_ui::{
+    Action, Animation, AnimationSettings, ControlInput, HudVisibility, PauseMenuState,
+    PlaybackSettings, RenderResolutionSettings, UiInputCapture,
+};
 
 use crate::axis_gizmo::{cursor_over_axis_gizmo, render_label_text, LabelTextLine};
 use crate::image_loading::MediaBillboard;
@@ -32,8 +35,8 @@ use crate::video_controls::{
     VideoPlaybackControl, VideoStripStatus,
 };
 use crate::video_strip_layout::{
-    place_strip, SliderSpan, StripLayout, StripPlacement, BUTTON_SIZE, ICON_SIZE, SPEAKER_SIZE,
-    STRIP_HEIGHT, TIME_LABEL_HEIGHT,
+    place_strip, place_strip_on_picture, SliderSpan, StripLayout, StripPlacement, BUTTON_SIZE,
+    ICON_SIZE, SPEAKER_SIZE, STRIP_HEIGHT, TIME_LABEL_HEIGHT,
 };
 use crate::{ExplorerScene, FlyCamera};
 
@@ -286,7 +289,7 @@ pub(crate) struct StripLabelAssets<'w> {
 /// (`handle_selection_and_drag` runs the same arbitration and stands down).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_video_strip_input(
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    input: ControlInput,
     pause_menu: Res<PauseMenuState>,
     ui_capture: Res<UiInputCapture>,
     render_resolution: Res<RenderResolutionSettings>,
@@ -350,16 +353,14 @@ pub(crate) fn handle_video_strip_input(
     let Some(hit) = nearest_strip_hit(ray_origin, ray_direction, &parts, occluder_distance) else {
         return;
     };
-    // A right-drag look sweeps strips under a still pointer; that is not
-    // hovering them.
-    if !mouse_buttons.pressed(MouseButton::Right) {
-        let controls = playback.state_mut();
-        controls.reveal(hit.image_id);
-        if hit.part.opens_volume_popup() {
-            controls.hover_volume(hit.image_id);
-        }
+    // A right-drag look sweeps strips under the look crosshair, where the
+    // pointer is parked: that hovers them too.
+    let controls = playback.state_mut();
+    controls.reveal(hit.image_id);
+    if hit.part.opens_volume_popup() {
+        controls.hover_volume(hit.image_id);
     }
-    if !mouse_buttons.just_pressed(MouseButton::Left) {
+    if !input.just_pressed(Action::Select) {
         return;
     }
     let Some(billboard) = billboards
@@ -399,14 +400,18 @@ pub(crate) fn handle_video_strip_input(
 }
 
 /// Spawns a strip for every video that should show one, despawns the rest,
-/// and places each against its video. Runs after billboards are faced and
-/// hidden for the frame and uses the camera's fresh `Transform`, so strips
-/// never trail a moving view or a dragged video.
+/// and places each against its video: following the part of it on screen
+/// while [`Animation::VideoStripFollowing`] plays, fixed on it otherwise.
+/// Runs after billboards are faced and hidden for the frame and uses the
+/// camera's fresh `Transform`, so strips never trail a moving view or a
+/// dragged video.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_video_strips(
     mut commands: Commands,
+    animations: Res<AnimationSettings>,
     controls_state: Res<VideoControlsState>,
     media_settings: Res<MediaSettings>,
+    playback_settings: Res<PlaybackSettings>,
     selection: Res<SelectionState>,
     scene: Res<ExplorerScene>,
     video_font: Res<VideoControlsFont>,
@@ -416,6 +421,7 @@ pub(crate) fn sync_video_strips(
     camera_query: StripCameraQuery,
     billboards: Query<(&MediaBillboard, &Transform, &Visibility), Without<VideoStripRoot>>,
     mut roots: StripRootQuery,
+    hud: Res<HudVisibility>,
 ) {
     let (Ok(window), Ok((camera, camera_transform, projection))) =
         (window_query.get_single(), camera_query.get_single())
@@ -428,18 +434,24 @@ pub(crate) fn sync_video_strips(
     };
     let mut wanted: HashMap<usize, _> = billboards
         .iter()
+        // None while the interface is hidden.
         .filter(|(billboard, _, visibility)| {
-            video_strip_wanted(&controls_state, &selection, billboard, visibility)
+            !hud.hidden && video_strip_wanted(&controls_state, &selection, billboard, visibility)
         })
         .map(|(billboard, transform, _)| {
-            let placement = place_strip(
-                camera,
-                camera_transform,
-                near,
-                transform,
-                billboard.content_half_extents(scene.billboard_world_size),
-                window.size(),
-            );
+            let half_extents = billboard.content_half_extents(scene.billboard_world_size);
+            let placement = if animations.plays(Animation::VideoStripFollowing) {
+                place_strip(
+                    camera,
+                    camera_transform,
+                    near,
+                    transform,
+                    half_extents,
+                    window.size(),
+                )
+            } else {
+                Some(place_strip_on_picture(transform, half_extents))
+            };
             (billboard.image_id, (billboard, placement))
         })
         .collect();
@@ -469,6 +481,7 @@ pub(crate) fn sync_video_strips(
         let status = controls_state.strip_status(
             image_id,
             duration_seconds,
+            playback_settings.remember_position,
             &media_settings.video(&billboard.path),
         );
         spawn_video_strip(
@@ -489,6 +502,7 @@ pub(crate) fn sync_video_strips(
 pub(crate) fn layout_video_strip_parts(
     controls_state: Res<VideoControlsState>,
     media_settings: Res<MediaSettings>,
+    playback_settings: Res<PlaybackSettings>,
     billboards: Query<&MediaBillboard>,
     roots: Query<(&VideoStripRoot, &StripLayout)>,
     mut parts: StripPartQuery,
@@ -503,6 +517,7 @@ pub(crate) fn layout_video_strip_parts(
     let statuses = strip_statuses(
         &controls_state,
         &media_settings,
+        playback_settings.remember_position,
         &billboards,
         layouts.keys().copied(),
     );
@@ -522,6 +537,7 @@ pub(crate) fn layout_video_strip_parts(
 pub(crate) fn update_video_strip_labels(
     controls_state: Res<VideoControlsState>,
     media_settings: Res<MediaSettings>,
+    playback_settings: Res<PlaybackSettings>,
     video_font: Res<VideoControlsFont>,
     mut label_assets: StripLabelAssets,
     billboards: Query<&MediaBillboard>,
@@ -541,6 +557,7 @@ pub(crate) fn update_video_strip_labels(
     let statuses = strip_statuses(
         &controls_state,
         &media_settings,
+        playback_settings.remember_position,
         &billboards,
         labels.iter().map(|(owner, ..)| owner.image_id),
     );
@@ -573,6 +590,7 @@ pub(crate) fn update_video_strip_labels(
 fn strip_statuses(
     controls_state: &VideoControlsState,
     media_settings: &MediaSettings,
+    remember_position: bool,
     billboards: &Query<&MediaBillboard>,
     image_ids: impl IntoIterator<Item = usize>,
 ) -> HashMap<usize, VideoStripStatus> {
@@ -584,6 +602,7 @@ fn strip_statuses(
             let status = controls_state.strip_status(
                 billboard.image_id,
                 video_duration_seconds(billboard),
+                remember_position,
                 &media_settings.video(&billboard.path),
             );
             (billboard.image_id, status)

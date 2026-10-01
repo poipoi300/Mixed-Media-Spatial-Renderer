@@ -1,9 +1,10 @@
 //! Geometry for video control strips.
 //!
 //! A strip is sized and positioned in screen space — overlaid along the
-//! bottom edge of its video's picture when it fits inside it, beside the
-//! picture otherwise, a constant height in pixels, never leaving the
-//! window — but lives in the world: it is placed on a
+//! bottom edge of the part of its video's picture inside the window, never
+//! reaching past that part, a constant height in pixels unless the picture
+//! is too small for it, where it shrinks to fit — but lives in the world:
+//! it is placed on a
 //! camera-facing plane just in front of the nearest visible point of its
 //! video, scaled so one local unit is one window pixel. Other content in
 //! front of the video therefore occludes the strip like any other geometry,
@@ -11,6 +12,11 @@
 //!
 //! Strip-local space: x right, y up, origin at the strip's center, one unit
 //! per window pixel; larger z is closer to the camera.
+//!
+//! While strips do not follow the view, a strip is instead fixed on its
+//! video's picture ([`place_strip_on_picture`]): laid out as if the picture
+//! showed at a set size on screen, it moves, turns and scales with the
+//! picture alone.
 
 use bevy::prelude::*;
 
@@ -20,13 +26,6 @@ const STRIP_MIN_WIDTH: f32 = 340.0;
 const STRIP_MAX_WIDTH: f32 = 720.0;
 /// Closest a strip may come to a window edge.
 const STRIP_WINDOW_MARGIN: f32 = 12.0;
-/// Gap between a strip and the edges of the picture it sits on (or under).
-const STRIP_VIDEO_INSET: f32 = 8.0;
-/// A picture must be at least this many strip heights tall on screen (and
-/// wide enough for the whole strip) to have its strip overlaid on it; a
-/// smaller one gets the strip just outside it rather than mostly hidden
-/// behind it.
-const STRIP_OVERLAY_MIN_VIDEO_HEIGHTS: f32 = 3.0;
 /// Clip depth as a multiple of the camera's near plane; a hair beyond it so
 /// clipped vertices are guaranteed to project.
 const NEAR_PLANE_CLIP_MARGIN: f32 = 1.001;
@@ -35,6 +34,12 @@ const NEAR_PLANE_CLIP_MARGIN: f32 = 1.001;
 const STRIP_DEPTH_PULL: f32 = 0.02;
 /// Closest a strip may come to the camera, as a multiple of the near plane.
 const STRIP_MIN_DEPTH_NEAR_PLANES: f32 = 1.05;
+/// A strip fixed on its picture is laid out as if the picture's longer side
+/// showed this many pixels long.
+const FIXED_STRIP_PICTURE_SIDE: f32 = 800.0;
+/// How far in front of its picture a fixed strip stands, as a fraction of
+/// the picture's longer half side, so the picture never cuts into it.
+const FIXED_STRIP_LIFT: f32 = 0.02;
 
 const STRIP_PADDING: f32 = 8.0;
 const STRIP_GAP: f32 = 10.0;
@@ -99,7 +104,7 @@ pub(crate) fn place_strip(
         .map(|point| point / viewport_per_window)
         .map(|point| Rect::from_corners(point, point))
         .reduce(|bounds, point| bounds.union(point))?;
-    let strip_rect = screen_strip_rect(picture_rect, window_size)?;
+    let strip = screen_strip(picture_rect, window_size)?;
 
     let nearest_depth = visible
         .iter()
@@ -119,19 +124,93 @@ pub(crate) fn place_strip(
             ray.origin + *ray.direction * distance
         })
     };
-    let center = strip_rect.center();
-    let left = point_at_depth(Vec2::new(strip_rect.min.x, center.y))?;
-    let right = point_at_depth(Vec2::new(strip_rect.max.x, center.y))?;
-    let units_per_pixel = left.distance(right) / strip_rect.width();
+    let center = strip.rect.center();
+    let left = point_at_depth(Vec2::new(strip.rect.min.x, center.y))?;
+    let right = point_at_depth(Vec2::new(strip.rect.max.x, center.y))?;
+    let units_per_strip_unit = left.distance(right) / strip.width;
     Some(StripPlacement {
         transform: Transform {
             translation: point_at_depth(center)?,
             rotation: camera_transform.rotation,
-            scale: Vec3::splat(units_per_pixel),
+            scale: Vec3::splat(units_per_strip_unit),
         },
-        width: strip_rect.width(),
-        volume_popup_upward: strip_rect.min.y >= VOLUME_POPUP_HEIGHT + STRIP_WINDOW_MARGIN,
+        width: strip.width,
+        volume_popup_upward: strip.rect.min.y
+            >= VOLUME_POPUP_HEIGHT * strip.scale + STRIP_WINDOW_MARGIN,
     })
+}
+
+/// Places the strip for a video whose picture is the quad with
+/// `half_extents` in `picture`'s local XY plane, fixed on the picture:
+/// along its bottom edge as [`place_strip`] would put it were the picture's
+/// longer side [`FIXED_STRIP_PICTURE_SIDE`] pixels on screen, whatever the
+/// view.
+pub(crate) fn place_strip_on_picture(picture: &Transform, half_extents: Vec2) -> StripPlacement {
+    let longer_half_side = half_extents.max_element().max(f32::EPSILON);
+    let pixels_per_unit = FIXED_STRIP_PICTURE_SIDE / (2.0 * longer_half_side);
+    let picture_pixels = 2.0 * half_extents * pixels_per_unit;
+    let strip = strip_in_area(Rect::from_corners(Vec2::ZERO, picture_pixels));
+    // Picture pixels run y down from its top left corner, picture-local
+    // units y up from its center.
+    let center = strip.rect.center();
+    let local = Vec2::new(
+        center.x - picture_pixels.x * 0.5,
+        picture_pixels.y * 0.5 - center.y,
+    ) / pixels_per_unit;
+    StripPlacement {
+        transform: Transform {
+            translation: picture.transform_point(local.extend(longer_half_side * FIXED_STRIP_LIFT)),
+            rotation: picture.rotation,
+            scale: Vec3::splat(picture.scale.x * strip.scale / pixels_per_unit),
+        },
+        width: strip.width,
+        volume_popup_upward: true,
+    }
+}
+
+/// A strip as the window shows it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScreenStrip {
+    /// Window rectangle, in logical pixels, y down.
+    rect: Rect,
+    /// Window pixels per strip-local unit: 1 at full size, less where the
+    /// picture is too small for the strip.
+    scale: f32,
+    /// Width in strip-local units.
+    width: f32,
+}
+
+/// The strip of a picture with on-screen bounds `picture_rect`: overlaid
+/// along the bottom edge of the part of the picture inside the window (short
+/// of its margin), centered on it, flush with that part's bottom edge and
+/// never reaching past it. The strip keeps its full size while that part
+/// holds it, and shrinks evenly to fit a smaller one, so its size and place
+/// follow the picture's edges continuously: a picture that grows, shrinks
+/// or recedes, as a hovered one does, moves its strip only with its edges.
+/// `None` when no part of the picture is inside the window's margin.
+fn screen_strip(picture_rect: Rect, window_size: Vec2) -> Option<ScreenStrip> {
+    let window = Rect::from_corners(Vec2::ZERO, window_size).inflate(-STRIP_WINDOW_MARGIN);
+    let area = picture_rect.intersect(window);
+    (!area.is_empty()).then(|| strip_in_area(area))
+}
+
+/// The strip overlaid along the bottom of `area`, a picture's part on
+/// screen; see [`screen_strip`].
+fn strip_in_area(area: Rect) -> ScreenStrip {
+    let scale = (area.width() / STRIP_MIN_WIDTH)
+        .min(area.height() / STRIP_HEIGHT)
+        .min(1.0);
+    let width = (area.width() / scale).clamp(STRIP_MIN_WIDTH, STRIP_MAX_WIDTH);
+    let size = Vec2::new(width, STRIP_HEIGHT) * scale;
+    let bottom_center = Vec2::new(area.center().x, area.max.y);
+    ScreenStrip {
+        rect: Rect::from_corners(
+            bottom_center - Vec2::new(size.x * 0.5, size.y),
+            bottom_center + Vec2::new(size.x * 0.5, 0.0),
+        ),
+        scale,
+        width,
+    }
 }
 
 /// Clips a convex polygon to the half-space at least `min_depth` in front
@@ -151,42 +230,6 @@ fn clip_polygon_to_depth(polygon: &[Vec3], eye: Vec3, forward: Vec3, min_depth: 
         }
     }
     clipped
-}
-
-/// Window rectangle (logical pixels, y down) for the strip of a picture
-/// with on-screen bounds `picture_rect`. Sized and centered on the part of
-/// the picture inside the window, and always fully inside the window. It is
-/// overlaid along the picture's bottom edge while it fits inside the
-/// picture; otherwise it goes just below the picture, rising over it as far
-/// as its top when the window's bottom edge leaves no room below. `None`
-/// when the picture is entirely off screen.
-fn screen_strip_rect(picture_rect: Rect, window_size: Vec2) -> Option<Rect> {
-    let visible = picture_rect.intersect(Rect::from_corners(Vec2::ZERO, window_size));
-    if visible.is_empty() {
-        return None;
-    }
-    let max_width = (window_size.x - 2.0 * STRIP_WINDOW_MARGIN).max(0.0);
-    let width = (visible.width() - 2.0 * STRIP_VIDEO_INSET)
-        .clamp(STRIP_MIN_WIDTH, STRIP_MAX_WIDTH)
-        .min(max_width);
-    let left = (visible.center().x - width * 0.5).clamp(
-        STRIP_WINDOW_MARGIN,
-        (window_size.x - STRIP_WINDOW_MARGIN - width).max(STRIP_WINDOW_MARGIN),
-    );
-    let overlaid = visible.width() >= width + 2.0 * STRIP_VIDEO_INSET
-        && visible.height() >= STRIP_HEIGHT * STRIP_OVERLAY_MIN_VIDEO_HEIGHTS;
-    let lowest_top = (window_size.y - STRIP_WINDOW_MARGIN - STRIP_HEIGHT).max(STRIP_WINDOW_MARGIN);
-    let top = if overlaid {
-        visible.max.y - STRIP_VIDEO_INSET - STRIP_HEIGHT
-    } else {
-        visible.max.y + STRIP_VIDEO_INSET
-    }
-    // Short of room below, the strip rises over the picture, never past its
-    // top — unless staying in the window demands it.
-    .min(lowest_top)
-    .max(visible.min.y)
-    .clamp(STRIP_WINDOW_MARGIN, lowest_top);
-    Some(Rect::new(left, top, left + width, top + STRIP_HEIGHT))
 }
 
 /// Which way a slider runs. Its parts are quads scaled, never rotated, so a
@@ -318,89 +361,123 @@ mod tests {
 
     const WINDOW: Vec2 = Vec2::new(1600.0, 1000.0);
 
-    fn assert_inside_window(strip: Rect) {
-        assert!(strip.min.x >= STRIP_WINDOW_MARGIN && strip.min.y >= STRIP_WINDOW_MARGIN);
-        assert!(strip.max.x <= WINDOW.x - STRIP_WINDOW_MARGIN);
-        assert!(strip.max.y <= WINDOW.y - STRIP_WINDOW_MARGIN);
+    fn strip_of(video: Rect) -> ScreenStrip {
+        screen_strip(video, WINDOW).expect("video is on screen")
+    }
+
+    fn assert_inside(strip: Rect, area: Rect) {
+        let slack = 1e-3;
+        let area = area.inflate(slack);
+        assert!(
+            area.contains(strip.min) && area.contains(strip.max),
+            "{strip:?} in {area:?}"
+        );
+    }
+
+    #[test]
+    fn a_large_video_hosts_its_full_size_strip_along_its_bottom_edge() {
+        let video = Rect::new(400.0, 200.0, 1000.0, 700.0);
+        let strip = strip_of(video);
+        assert_eq!(strip.scale, 1.0);
+        assert_eq!(strip.rect.max.y, video.max.y);
+        assert_eq!(strip.rect.center().x, video.center().x);
+        assert_eq!(strip.rect.width(), video.width());
     }
 
     #[test]
     fn a_video_overflowing_the_window_keeps_its_strip_on_screen() {
         let video = Rect::new(-400.0, -300.0, 2000.0, 1800.0);
-        let strip = screen_strip_rect(video, WINDOW).expect("video is on screen");
-        assert_inside_window(strip);
-        assert_eq!(strip.max.y, WINDOW.y - STRIP_WINDOW_MARGIN);
-        assert_eq!(strip.width(), STRIP_MAX_WIDTH);
+        let strip = strip_of(video);
+        let window = Rect::from_corners(Vec2::ZERO, WINDOW).inflate(-STRIP_WINDOW_MARGIN);
+        assert_inside(strip.rect, window);
+        assert_eq!(strip.rect.max.y, window.max.y);
+        assert_eq!(strip.width, STRIP_MAX_WIDTH);
     }
 
     #[test]
-    fn a_large_video_hosts_its_strip_along_its_bottom_edge() {
-        let video = Rect::new(400.0, 200.0, 1000.0, 700.0);
-        let strip = screen_strip_rect(video, WINDOW).expect("video is on screen");
-        assert_eq!(strip.max.y, video.max.y - STRIP_VIDEO_INSET);
-        assert_eq!(strip.center().x, video.center().x);
-    }
+    fn a_fixed_strip_sits_on_its_picture_bottom_edge_and_moves_with_it() {
+        let half_extents = Vec2::new(1.0, 0.5625);
+        let picture = Transform::from_translation(Vec3::new(3.0, 1.0, -2.0))
+            .with_rotation(Quat::from_rotation_y(0.7))
+            .with_scale(Vec3::splat(2.0));
+        let placement = place_strip_on_picture(&picture, half_extents);
+        // In picture-local space: flush with the bottom edge, centered,
+        // no wider than the picture and just in front of it.
+        let local = picture
+            .compute_matrix()
+            .inverse()
+            .transform_point3(placement.transform.translation);
+        let local_units_per_strip_unit = placement.transform.scale.x / picture.scale.x;
+        let strip_bottom = local.y - STRIP_HEIGHT * 0.5 * local_units_per_strip_unit;
+        assert!((strip_bottom + half_extents.y).abs() < 1e-4);
+        assert!(local.x.abs() < 1e-4);
+        assert!(local.z > 0.0);
+        assert!(placement.width * local_units_per_strip_unit <= 2.0 * half_extents.x + 1e-4);
+        assert_eq!(placement.transform.rotation, picture.rotation);
 
-    #[test]
-    fn a_video_narrower_than_the_strip_gets_it_below_however_tall_it_is() {
-        let narrow = Rect::new(700.0, 100.0, 700.0 + STRIP_MIN_WIDTH, 700.0);
-        let strip = screen_strip_rect(narrow, WINDOW).expect("video is on screen");
-        assert_eq!(strip.min.y, narrow.max.y + STRIP_VIDEO_INSET);
-        let wide_enough = Rect::new(
-            700.0,
-            100.0,
-            700.0 + STRIP_MIN_WIDTH + 2.0 * STRIP_VIDEO_INSET,
-            700.0,
+        let moved = picture.with_translation(Vec3::new(-5.0, 0.0, 4.0));
+        let moved_placement = place_strip_on_picture(&moved, half_extents);
+        let offset = moved.translation - picture.translation;
+        assert!(
+            (moved_placement.transform.translation - placement.transform.translation - offset)
+                .length()
+                < 1e-4
         );
-        let strip = screen_strip_rect(wide_enough, WINDOW).expect("video is on screen");
-        assert_eq!(strip.max.y, wide_enough.max.y - STRIP_VIDEO_INSET);
     }
 
     #[test]
-    fn a_small_video_at_the_window_bottom_gets_its_strip_over_it_never_above() {
-        let video = Rect::new(700.0, 900.0, 800.0, 980.0);
-        let strip = screen_strip_rect(video, WINDOW).expect("video is on screen");
-        assert_inside_window(strip);
-        assert!(strip.min.y >= video.min.y);
+    fn a_small_video_shrinks_its_strip_to_fit_inside_it() {
+        for video in [
+            Rect::new(700.0, 300.0, 760.0, 360.0),
+            Rect::new(700.0, 100.0, 700.0 + STRIP_MIN_WIDTH - 1.0, 700.0),
+            Rect::new(100.0, 400.0, 1200.0, 420.0),
+        ] {
+            let strip = strip_of(video);
+            assert!(strip.scale < 1.0);
+            assert_inside(strip.rect, video);
+            assert!((strip.rect.width() - strip.width * strip.scale).abs() < 1e-3);
+            assert!((strip.rect.height() - STRIP_HEIGHT * strip.scale).abs() < 1e-3);
+        }
     }
 
     #[test]
-    fn a_small_video_gets_its_strip_just_below_it() {
-        let video = Rect::new(700.0, 300.0, 760.0, 360.0);
-        let strip = screen_strip_rect(video, WINDOW).expect("video is on screen");
-        assert_eq!(strip.min.y, video.max.y + STRIP_VIDEO_INSET);
-        assert_eq!(strip.width(), STRIP_MIN_WIDTH);
+    fn a_video_shrinking_past_the_full_size_strip_moves_it_continuously() {
+        // Just wide enough for the full-size strip, then a hair narrower.
+        let video = Rect::new(600.0, 300.0, 600.0 + STRIP_MIN_WIDTH, 600.0);
+        let narrower = Rect::new(600.0, 300.0, 600.0 + STRIP_MIN_WIDTH - 1.0, 600.0);
+        let (strip, shrunk) = (strip_of(video), strip_of(narrower));
+        assert_eq!(strip.scale, 1.0);
+        assert!(shrunk.scale < 1.0);
+        // Both stay flush with the bottom and sides, and barely differ.
+        for (strip, video) in [(strip, video), (shrunk, narrower)] {
+            assert_eq!(strip.rect.max.y, video.max.y);
+            assert!((strip.rect.width() - video.width()).abs() < 1e-3);
+        }
+        assert!((strip.rect.min.y - shrunk.rect.min.y).abs() < 0.2);
     }
 
     #[test]
-    fn a_video_at_the_window_edge_is_clamped_inside() {
-        let video = Rect::new(-50.0, 900.0, 100.0, 1100.0);
-        let strip = screen_strip_rect(video, WINDOW).expect("video is on screen");
-        assert_inside_window(strip);
+    fn a_growing_video_moves_its_strip_only_with_its_edges() {
+        let video = Rect::new(700.0, 300.0, 1000.0, 500.0);
+        let grown = video.inflate(20.0);
+        let (strip, grown_strip) = (strip_of(video), strip_of(grown));
+        assert_inside(strip.rect, video);
+        assert_inside(grown_strip.rect, grown);
+        assert_eq!(strip.rect.center().x, grown_strip.rect.center().x);
+        assert!(grown_strip.rect.max.y > strip.rect.max.y);
     }
 
     #[test]
     fn a_partly_visible_video_centers_its_strip_on_the_visible_part() {
-        // Centered on the unclipped picture, the strip would pin to the
-        // left window edge instead.
         let video = Rect::new(-2000.0, 200.0, 1000.0, 800.0);
-        let strip = screen_strip_rect(video, WINDOW).expect("video is on screen");
-        assert_eq!(strip.center().x, 500.0);
+        let strip = strip_of(video);
+        assert_eq!(strip.rect.center().x, (STRIP_WINDOW_MARGIN + 1000.0) * 0.5);
     }
 
     #[test]
     fn an_off_screen_video_has_no_strip() {
         let video = Rect::new(-500.0, 100.0, -100.0, 400.0);
-        assert!(screen_strip_rect(video, WINDOW).is_none());
-    }
-
-    #[test]
-    fn a_narrow_window_narrows_the_strip() {
-        let window = Vec2::new(200.0, 400.0);
-        let video = Rect::new(0.0, 0.0, 200.0, 400.0);
-        let strip = screen_strip_rect(video, window).expect("video is on screen");
-        assert_eq!(strip.width(), window.x - 2.0 * STRIP_WINDOW_MARGIN);
-        assert_eq!(strip.min.x, STRIP_WINDOW_MARGIN);
+        assert!(screen_strip(video, WINDOW).is_none());
     }
 
     #[test]

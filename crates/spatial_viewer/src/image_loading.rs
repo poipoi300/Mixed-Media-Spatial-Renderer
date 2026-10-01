@@ -14,16 +14,18 @@ use spatial_viewer_ui::{
 };
 
 use crate::{
-    axis_gizmo::{render_label_text, LabelTextLine},
+    axis_gizmo::{render_label_text_with_shadow, LabelShadow, LabelTextLine, AXIS_TEXT_COLORS},
     background_work::{spawn_background, CancelToken, CompletedWork},
     decode_budget::DecodeBudget,
+    folders::BillboardGrowth,
     load_sampling::{load_value, load_value_sigma, WeightedReservoir},
     media_decode::{
-        billboard_surface_bytes, billboard_surface_to_bevy_image, decode_first_video_frame,
+        billboard_surface_bytes, billboard_surface_to_bevy_image, decode_video_still,
         encode_billboard_surface, fit_image_to_square, open_image_file, BillboardTextureEncoding,
         BillboardTextureFormat, DecodedBillboardImage, DecodedImage, SurfaceEncodeTally,
     },
     point_cloud::{PointCloud, ViewBounds},
+    video_controls::VideoStillTimes,
     FlyCamera,
 };
 
@@ -40,7 +42,6 @@ const COORDINATE_LABEL_FORWARD_OFFSET_FACTOR: f32 = 0.01;
 /// allowed to grow before it wraps onto another line.
 const COORDINATE_LABEL_MAX_WIDTH_FACTOR: f32 = 2.5;
 const COORDINATE_LABEL_FONT_SIZE: f32 = 46.0;
-const COORDINATE_LABEL_COLOR: [u8; 4] = [235, 240, 248, 255];
 
 const BILLBOARD_ORIENTATION_MAX_DISTANCE_FACTOR: f32 = 96.0;
 const BILLBOARD_NEAR_VISIBLE_DOT: f32 = -0.15;
@@ -82,7 +83,9 @@ const BILLBOARD_QUALITY_LOOKAHEAD_MAX_STEPS: f32 = 12.0;
 /// weighted, and cells near the camera are visited first and every frame.
 const BILLBOARD_PENDING_CELLS_PER_FRAME: usize = 192;
 
+/// Every billboard is drawn at its layout's size times its growth.
 #[derive(Component)]
+#[require(BillboardGrowth)]
 pub struct MediaBillboard {
     pub image_id: usize,
     pub path: Arc<str>,
@@ -142,7 +145,11 @@ pub struct BillboardSurfaceAssets {
 }
 
 impl BillboardSurfaceAssets {
-    fn remove(&self, images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>) {
+    pub(crate) fn remove(
+        &self,
+        images: &mut Assets<Image>,
+        materials: &mut Assets<StandardMaterial>,
+    ) {
         if let Some(material) = &self.material_handle {
             materials.remove(material.id());
         }
@@ -161,6 +168,9 @@ pub struct BillboardPoint {
     pub image_id: usize,
     pub path: Arc<str>,
     pub position: Vec3,
+    /// Size relative to a full billboard: below 1 for the small previews a
+    /// closed folder shows.
+    pub scale: f32,
     pub is_video: bool,
     pub duration_seconds: Option<f32>,
     /// Source pixel dimensions, when the catalog knows them. Used to charge
@@ -225,9 +235,22 @@ pub struct BillboardCoordinateLabel;
 #[derive(Component)]
 pub(crate) struct BillboardCoordinateLabelReady;
 
+/// A billboard whose point left the scene, handed back to the caller of
+/// [`ImageLoadingState::update_points`], which owns taking it off screen.
+pub struct RetiredBillboard {
+    pub image_id: usize,
+    pub entity: Entity,
+    pub position: Vec3,
+    pub scale: f32,
+    pub surface_assets: BillboardSurfaceAssets,
+}
+
 #[derive(Resource)]
 pub struct ImageLoadingState {
     pending: SpatialPendingIndex,
+    /// Bumped whenever the point set is replaced or updated, so systems
+    /// that derive per-billboard state from points know to refresh it.
+    points_revision: u64,
     in_flight: HashMap<usize, InFlightLoad>,
     loaded: HashMap<usize, LoadedBillboardRecord>,
     failed: HashSet<usize>,
@@ -373,10 +396,6 @@ pub struct SpatialPendingIndex {
     len: usize,
 }
 
-pub fn billboard_world_size(coordinate_spacing: f32, scale: f32) -> f32 {
-    coordinate_spacing.max(1.0) * scale.clamp(0.1, 1.5)
-}
-
 pub fn create_billboard_mesh(meshes: &mut Assets<Mesh>, world_size: f32) -> BillboardMesh {
     BillboardMesh(meshes.add(Rectangle::new(world_size, world_size)))
 }
@@ -390,6 +409,7 @@ impl ImageLoadingState {
     ) -> Self {
         Self {
             pending: SpatialPendingIndex::new(points),
+            points_revision: 0,
             in_flight: HashMap::new(),
             loaded: HashMap::new(),
             failed: HashSet::new(),
@@ -417,6 +437,7 @@ impl ImageLoadingState {
         _max_texture_side: u32,
     ) {
         let outgoing_pending = std::mem::replace(&mut self.pending, pending.0);
+        self.points_revision += 1;
         let outgoing_in_flight = std::mem::take(&mut self.in_flight);
         let outgoing_loaded = std::mem::take(&mut self.loaded);
         // Every decode for the outgoing catalog is now pointless work.
@@ -447,50 +468,75 @@ impl ImageLoadingState {
         }
     }
 
-    /// Reconciles a complete streamed catalog snapshot without resetting
-    /// matching loaded or decoding media. Returns `false` when a retained
-    /// billboard's ID/path identity is missing or changed; callers must then
-    /// tear down the scene and call [`Self::reset`] instead.
-    pub fn update_points(&mut self, points: Vec<BillboardPoint>) -> bool {
+    /// Reconciles a new point set without resetting matching loaded or
+    /// decoding media, adopting the new positions and scales. Media whose
+    /// point is gone (a folder closed over it) is dropped: its decode is
+    /// cancelled, and its billboard is returned for the caller to take off
+    /// screen. Returns `None`, changing nothing, when a retained billboard's
+    /// ID/path identity changed; callers must then tear down the scene and
+    /// reset instead.
+    pub fn update_points(&mut self, points: Vec<BillboardPoint>) -> Option<Vec<RetiredBillboard>> {
         let mut points_by_id = HashMap::with_capacity(points.len());
         for point in points {
             if points_by_id.insert(point.image_id, point).is_some() {
-                return false;
+                return None;
             }
         }
 
-        for record in self.loaded.values() {
-            let Some(point) = points_by_id.get(&record.point.image_id) else {
-                return false;
-            };
-            if point.path != record.point.path {
-                return false;
-            }
+        let identity_changed = |point: &BillboardPoint| {
+            points_by_id
+                .get(&point.image_id)
+                .is_some_and(|next| next.path != point.path)
+        };
+        if self
+            .loaded
+            .values()
+            .any(|record| identity_changed(&record.point))
+            || self
+                .in_flight
+                .values()
+                .any(|load| identity_changed(&load.point))
+        {
+            return None;
         }
-        for load in self.in_flight.values() {
-            let Some(point) = points_by_id.get(&load.point.image_id) else {
-                return false;
-            };
-            if point.path != load.point.path {
-                return false;
+
+        self.in_flight.retain(|image_id, load| {
+            let kept = points_by_id.contains_key(image_id);
+            if !kept {
+                load.cancel.cancel();
             }
-        }
+            kept
+        });
+        let gone: Vec<usize> = self
+            .loaded
+            .keys()
+            .filter(|image_id| !points_by_id.contains_key(image_id))
+            .copied()
+            .collect();
+        let retired = gone
+            .into_iter()
+            .filter_map(|image_id| self.loaded.remove(&image_id))
+            .map(|record| RetiredBillboard {
+                image_id: record.point.image_id,
+                entity: record.entity,
+                position: record.point.position,
+                scale: record.point.scale,
+                surface_assets: record.surface_assets,
+            })
+            .collect();
+        self.points_revision += 1;
 
         for record in self.loaded.values_mut() {
-            let mut updated = points_by_id
+            record.point = points_by_id
                 .get(&record.point.image_id)
                 .expect("loaded billboard identity was validated above")
                 .clone();
-            updated.position = record.point.position;
-            record.point = updated;
         }
         for load in self.in_flight.values_mut() {
-            let mut updated = points_by_id
+            load.point = points_by_id
                 .get(&load.point.image_id)
                 .expect("in-flight billboard identity was validated above")
                 .clone();
-            updated.position = load.point.position;
-            load.point = updated;
         }
         for image_id in self.loaded.keys().chain(self.in_flight.keys()) {
             points_by_id.remove(image_id);
@@ -504,7 +550,7 @@ impl ImageLoadingState {
                 .filter(|point| !self.failed.contains(&point.image_id))
                 .collect(),
         );
-        true
+        Some(retired)
     }
 
     fn return_to_pending(&mut self, point: BillboardPoint) {
@@ -564,6 +610,16 @@ impl ImageLoadingState {
         if let Some(record) = self.loaded.get_mut(&image_id) {
             record.point.position = position;
         }
+    }
+
+    /// Where and how large a loaded billboard belongs, which its entity
+    /// must follow.
+    pub fn loaded_point(&self, image_id: usize) -> Option<&BillboardPoint> {
+        self.loaded.get(&image_id).map(|record| &record.point)
+    }
+
+    pub fn loaded_entity(&self, image_id: usize) -> Option<Entity> {
+        self.loaded.get(&image_id).map(|record| record.entity)
     }
 
     /// Whether admitting `point` would exceed the VRAM budget.
@@ -635,6 +691,7 @@ pub fn schedule_image_loads(
     view_bounds: Res<ViewBounds>,
     texture_encoding: Res<BillboardTextureEncoding>,
     mut budget: ResMut<DecodeBudget>,
+    video_still_times: VideoStillTimes,
     camera_query: Query<(&Transform, &FlyCamera)>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -714,7 +771,10 @@ pub fn schedule_image_loads(
             }
         }
         let texture_limit = billboard_texture_limit(&controls, *texture_encoding, point.is_video);
-        start_image_load(&mut state, point, texture_limit);
+        let video_still_seconds = point
+            .is_video
+            .then(|| video_still_times.still_seconds(point.image_id, &point.path));
+        start_image_load(&mut state, point, texture_limit, video_still_seconds);
     }
 }
 
@@ -980,7 +1040,8 @@ pub fn receive_image_loads(
 
                 let entity = commands
                     .spawn((
-                        Transform::from_translation(point.position),
+                        Transform::from_translation(point.position)
+                            .with_scale(Vec3::splat(point.scale)),
                         Visibility::Inherited,
                         Name::new(format!("media billboard {}", point.image_id)),
                     ))
@@ -1089,9 +1150,15 @@ pub fn spawn_visible_coordinate_labels(
         .values()
         .filter(|record| ready.get(record.entity).is_err())
         .take(BILLBOARD_COORDINATE_LABEL_SPAWNS_PER_FRAME)
-        .map(|record| (record.entity, record.point.coordinate_labels.clone()))
+        .map(|record| {
+            (
+                record.entity,
+                record.point.coordinate_labels.clone(),
+                labelled_at_scale(record.point.scale),
+            )
+        })
         .collect::<Vec<_>>();
-    for (entity, coordinate_labels) in candidates {
+    for (entity, coordinate_labels, visible) in candidates {
         commands
             .entity(entity)
             .insert(BillboardCoordinateLabelReady);
@@ -1105,9 +1172,15 @@ pub fn spawn_visible_coordinate_labels(
             entity,
             &lines,
             billboard_world_size.0,
-            true,
+            visible,
         );
     }
+}
+
+/// Only a full-size billboard shows its coordinates: a folder's small
+/// previews would each repeat the folder's coordinate, too small to read.
+fn labelled_at_scale(scale: f32) -> bool {
+    scale >= 1.0
 }
 
 pub fn face_billboards_to_camera(
@@ -1116,7 +1189,7 @@ pub fn face_billboards_to_camera(
     pause_menu: Res<PauseMenuState>,
     mut stats: ResMut<BillboardStats>,
     camera_query: Query<&Transform, (With<FlyCamera>, Without<MediaBillboard>)>,
-    mut billboard_query: Query<&mut Transform, With<MediaBillboard>>,
+    mut billboard_query: Query<(&mut Transform, Ref<MediaBillboard>)>,
     mut last_snapshot: Local<Option<BillboardFacingSnapshot>>,
 ) {
     if pause_menu.paused {
@@ -1134,15 +1207,13 @@ pub fn face_billboards_to_camera(
         rotation: camera_transform.rotation,
         axis: settings.axis,
     };
-    if let Some(previous) = *last_snapshot {
-        if !billboard_facing_snapshot_changed(previous, snapshot) {
-            stats.orientation_updated = 0;
-            stats.orientation_checked = 0;
-            stats.orientation_skipped = billboard_query.iter().len();
-            return;
-        }
+    // A still camera leaves every billboard facing it already, except those
+    // spawned since: they start unturned, wherever they are.
+    let camera_moved =
+        last_snapshot.is_none_or(|previous| billboard_facing_snapshot_changed(previous, snapshot));
+    if camera_moved {
+        *last_snapshot = Some(snapshot);
     }
-    *last_snapshot = Some(snapshot);
 
     let camera_position = camera_transform.translation;
     let camera_forward = camera_transform.rotation.mul_vec3(Vec3::NEG_Z);
@@ -1153,14 +1224,17 @@ pub fn face_billboards_to_camera(
     let mut updated = 0;
     let mut checked = 0;
     let mut skipped = 0;
-    for mut transform in &mut billboard_query {
+    for (mut transform, billboard) in &mut billboard_query {
         checked += 1;
-        if !billboard_should_update(
-            camera_position,
-            camera_forward,
-            transform.translation,
-            max_distance_squared,
-        ) {
+        let wanted = billboard.is_added()
+            || (camera_moved
+                && billboard_should_update(
+                    camera_position,
+                    camera_forward,
+                    transform.translation,
+                    max_distance_squared,
+                ));
+        if !wanted {
             skipped += 1;
             continue;
         }
@@ -1216,16 +1290,21 @@ fn billboard_facing_snapshot_changed(
 
 /// Builds one "Axis label: value" line per axis that has both a dimension
 /// assigned and a recorded value for this point (e.g. "Acquisition Date:
-/// 2024-03-15"); axes with no dimension selected are omitted entirely.
+/// 2024-03-15"), with the axis it is for; axes with no dimension selected
+/// are omitted entirely.
 fn coordinate_label_lines(
     axis_labels: &[Option<String>; 3],
     coordinate_labels: &[Option<Arc<str>>; 3],
-) -> Vec<String> {
+) -> Vec<(usize, String)> {
     axis_labels
         .iter()
         .zip(coordinate_labels.iter())
-        .filter_map(|(axis_label, value)| {
-            Some(format!("{}: {}", axis_label.as_deref()?, value.as_deref()?))
+        .enumerate()
+        .filter_map(|(axis, (axis_label, value))| {
+            Some((
+                axis,
+                format!("{}: {}", axis_label.as_deref()?, value.as_deref()?),
+            ))
         })
         .collect()
 }
@@ -1243,7 +1322,7 @@ fn spawn_coordinate_label(
     images: &mut Assets<Image>,
     font: &FontArc,
     billboard_entity: Entity,
-    lines: &[String],
+    lines: &[(usize, String)],
     billboard_world_size: f32,
     visible: bool,
 ) {
@@ -1252,17 +1331,21 @@ fn spawn_coordinate_label(
     }
     let text_lines: Vec<LabelTextLine> = lines
         .iter()
-        .map(|line| LabelTextLine {
+        // Each line in its axis's color, so the axes tell apart at a glance.
+        .map(|(axis, line)| LabelTextLine {
             text: line,
             font_size: COORDINATE_LABEL_FONT_SIZE,
-            color: COORDINATE_LABEL_COLOR,
+            color: AXIS_TEXT_COLORS[*axis],
         })
         .collect();
-    let rendered = render_label_text(
+    // Labels hang over whatever sits below the billboard, often another
+    // picture, so they get a dark halo rather than just a drop shadow.
+    let rendered = render_label_text_with_shadow(
         font,
         &text_lines,
         billboard_world_size * COORDINATE_LABEL_LINE_HEIGHT_FACTOR * lines.len() as f32,
         billboard_world_size * COORDINATE_LABEL_MAX_WIDTH_FACTOR,
+        LabelShadow::Halo,
     );
     let texture = images.add(rendered.image);
     let mesh = meshes.add(Rectangle::new(rendered.world_size.x, rendered.world_size.y));
@@ -1298,22 +1381,32 @@ fn spawn_coordinate_label(
 }
 
 /// Shows or hides every billboard's coordinate label when the "Show
-/// coordinates" checkbox changes; labels are already baked at spawn time, so
-/// this only ever flips visibility, never re-renders text.
+/// coordinates" checkbox changes or the points change size (a folder opening
+/// or closing); labels are already baked at spawn time, so this only ever
+/// flips visibility, never re-renders text.
 pub fn update_billboard_coordinate_label_visibility(
     controls: Res<BillboardControls>,
-    mut labels: Query<&mut Visibility, With<BillboardCoordinateLabel>>,
+    state: Res<ImageLoadingState>,
+    billboards: Query<&MediaBillboard>,
+    mut labels: Query<(&Parent, &mut Visibility), With<BillboardCoordinateLabel>>,
+    mut applied_points_revision: Local<Option<u64>>,
 ) {
-    if !controls.is_changed() {
+    if !controls.is_changed() && *applied_points_revision == Some(state.points_revision) {
         return;
     }
-    let visibility = if controls.show_coordinates {
-        Visibility::Inherited
-    } else {
-        Visibility::Hidden
-    };
-    for mut label_visibility in &mut labels {
-        *label_visibility = visibility;
+    *applied_points_revision = Some(state.points_revision);
+    for (parent, mut label_visibility) in &mut labels {
+        let full_size = billboards
+            .get(parent.get())
+            .ok()
+            .and_then(|billboard| state.loaded_point(billboard.image_id))
+            .is_none_or(|point| labelled_at_scale(point.scale));
+        let visibility = if controls.show_coordinates && full_size {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        label_visibility.set_if_neq(visibility);
     }
 }
 
@@ -1358,7 +1451,14 @@ fn evict_loaded_billboard(
     }
 }
 
-fn start_image_load(state: &mut ImageLoadingState, point: BillboardPoint, texture_limit: u32) {
+/// `video_still_seconds` is `Some` for a video: the time its still frame is
+/// decoded at (see [`VideoStillTimes`]).
+fn start_image_load(
+    state: &mut ImageLoadingState,
+    point: BillboardPoint,
+    texture_limit: u32,
+    video_still_seconds: Option<f32>,
+) {
     let cancel = CancelToken::new();
     state.in_flight.insert(
         point.image_id,
@@ -1372,7 +1472,7 @@ fn start_image_load(state: &mut ImageLoadingState, point: BillboardPoint, textur
     let texture_format = state.texture_format;
     let completed = state.completed.clone();
     spawn_background(move || {
-        let outcome = decode_billboard_image(&point, texture_limit, &cancel);
+        let outcome = decode_billboard_image(&point, texture_limit, video_still_seconds, &cancel);
         let cancelled = cancel.is_cancelled();
         let result = match outcome {
             Ok(decoded) => Ok(encode_billboard_surface(&decoded, texture_format)),
@@ -1400,15 +1500,16 @@ fn start_image_load(state: &mut ImageLoadingState, point: BillboardPoint, textur
 fn decode_billboard_image(
     point: &BillboardPoint,
     texture_limit: u32,
+    video_still_seconds: Option<f32>,
     cancel: &CancelToken,
 ) -> anyhow::Result<DecodedImage> {
     if cancel.is_cancelled() {
         anyhow::bail!("cancelled");
     }
-    if point.is_video {
+    if let Some(still_seconds) = video_still_seconds {
         // ffmpeg runs as one uninterruptible child process, so the only
         // useful checks are before starting it and after it returns.
-        let frame = decode_first_video_frame(Path::new(&*point.path), texture_limit)?;
+        let frame = decode_video_still(Path::new(&*point.path), still_seconds, texture_limit)?;
         if cancel.is_cancelled() {
             anyhow::bail!("cancelled");
         }
@@ -1912,7 +2013,11 @@ fn axis_vector(axis: BillboardFacingAxis) -> Vec3 {
 
 #[cfg(test)]
 mod tests {
+    use spatial_viewer_ui::PlaybackSettings;
+
     use super::*;
+    use crate::media_settings::MediaSettings;
+    use crate::video_controls::VideoControlsState;
 
     /// Surfaces must stay in a depth-writing phase. A blended alpha mode
     /// moves them into the sorted transparent phase, where per-mesh distance
@@ -2102,6 +2207,7 @@ mod tests {
             image_id,
             path: format!("image-{image_id}.png").into(),
             position,
+            scale: 1.0,
             is_video: false,
             duration_seconds: None,
             source_size: None,
@@ -2524,6 +2630,9 @@ mod tests {
             .insert_resource(ViewBounds::default())
             .insert_resource(BillboardTextureEncoding::default())
             .insert_resource(DecodeBudget::new(2))
+            .init_resource::<VideoControlsState>()
+            .insert_resource(MediaSettings::in_memory())
+            .init_resource::<PlaybackSettings>()
             .init_resource::<Assets<Image>>()
             .init_resource::<Assets<StandardMaterial>>()
             .init_resource::<PointCloud>()

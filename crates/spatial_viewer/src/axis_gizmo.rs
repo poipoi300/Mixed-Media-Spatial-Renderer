@@ -2,7 +2,6 @@ use std::{env, fs, path::PathBuf};
 
 use ab_glyph::{point, Font, FontArc, GlyphId, PxScale, ScaleFont};
 use bevy::{
-    input::mouse::MouseButton,
     math::primitives::{Cuboid, Cylinder, Rectangle},
     prelude::*,
     render::{
@@ -16,7 +15,10 @@ use bevy::{
     window::PrimaryWindow,
 };
 use image::{Rgba, RgbaImage};
-use spatial_viewer_ui::{AxisGizmoFace, AxisGizmoState, PauseMenuState, UiInputCapture};
+use spatial_viewer_ui::{
+    Action, AxisGizmoFace, AxisGizmoState, ControlInput, HudVisibility, PauseMenuState,
+    UiInputCapture,
+};
 
 use super::{BillboardLabelFont, FlyCamera, PRESENTATION_RENDER_LAYER};
 
@@ -484,7 +486,10 @@ fn build_gizmo_label_variants(
     );
     AxisGizmoLabelVariants { normal, hovered }
 }
+/// Sizes the gizmo's viewport to the window, or turns it off when the
+/// window is too small for it or the interface is hidden.
 pub fn update_axis_gizmo_viewport(
+    hud: Res<HudVisibility>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cameras: Query<&mut Camera, With<AxisGizmoCamera>>,
     mut canvases: Query<(&mut Sprite, &mut Transform, &mut Visibility), With<AxisGizmoCanvas>>,
@@ -492,6 +497,7 @@ pub fn update_axis_gizmo_viewport(
     let layout = windows
         .get_single()
         .ok()
+        .filter(|_| !hud.hidden)
         .and_then(|window| axis_gizmo_canvas_layout(window.resolution.size()));
     let Some(layout) = layout else {
         for mut camera in &mut cameras {
@@ -614,7 +620,7 @@ pub fn update_axis_gizmo_label_hover(
 }
 
 pub fn handle_axis_gizmo_clicks(
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    input: ControlInput,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<AxisGizmoCamera>>,
     pause_menu: Res<PauseMenuState>,
@@ -624,7 +630,7 @@ pub fn handle_axis_gizmo_clicks(
     if pause_menu.paused || capture.blocks_world_clicks() {
         return;
     }
-    if !mouse_buttons.just_pressed(MouseButton::Left) {
+    if !input.just_pressed(Action::Select) {
         return;
     }
     let Some(ray) = gizmo_cursor_ray(&windows, &camera) else {
@@ -806,11 +812,59 @@ pub(crate) struct RenderedLabelText {
     pub(crate) world_size: Vec2,
 }
 
+/// What separates label text from whatever is drawn behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LabelShadow {
+    /// A soft shadow down and to the right: enough over a dark backdrop.
+    Drop,
+    /// A dark outline all around plus the drop shadow, for text that may
+    /// sit over a bright picture.
+    Halo,
+}
+
+/// Dark copies drawn under the text for each shadow: pixel offsets and
+/// alpha, drawn in order.
+fn shadow_passes(shadow: LabelShadow) -> &'static [(f32, f32, u8)] {
+    const DROP: [(f32, f32, u8); 2] = [(3.0, 3.0, 155), (1.5, 1.5, 220)];
+    const HALO: [(f32, f32, u8); 10] = [
+        (4.0, 4.0, 200),
+        (2.5, 2.5, 220),
+        (-2.5, 0.0, 170),
+        (2.5, 0.0, 170),
+        (0.0, -2.5, 170),
+        (0.0, 2.5, 170),
+        (-1.8, -1.8, 170),
+        (1.8, -1.8, 170),
+        (-1.8, 1.8, 170),
+        (1.8, 1.8, 170),
+    ];
+    match shadow {
+        LabelShadow::Drop => &DROP,
+        LabelShadow::Halo => &HALO,
+    }
+}
+
 pub(crate) fn render_label_text(
     font: &FontArc,
     lines: &[LabelTextLine<'_>],
     world_height: f32,
     max_world_width: f32,
+) -> RenderedLabelText {
+    render_label_text_with_shadow(
+        font,
+        lines,
+        world_height,
+        max_world_width,
+        LabelShadow::Drop,
+    )
+}
+
+pub(crate) fn render_label_text_with_shadow(
+    font: &FontArc,
+    lines: &[LabelTextLine<'_>],
+    world_height: f32,
+    max_world_width: f32,
+    shadow: LabelShadow,
 ) -> RenderedLabelText {
     let fallback_line = [LabelTextLine {
         text: " ",
@@ -885,7 +939,7 @@ pub(crate) fn render_label_text(
         let baseline = baseline_cursor + scaled_font.ascent();
         let pixel_width = line_width(font, *scale, text);
         let x = (rgba.width() as f32 - pixel_width) * 0.5;
-        draw_shadowed_text_line(&mut rgba, font, *scale, text, x, baseline, *color);
+        draw_shadowed_text_line(&mut rgba, font, *scale, text, x, baseline, *color, shadow);
         baseline_cursor += *line_height;
     }
 
@@ -907,6 +961,90 @@ pub(crate) fn render_label_text(
     }
 }
 
+/// A tag `world_height` tall: `badge` on a filled pill, then `spans` of
+/// text in their own colors, on the dark halo labels carry.
+pub(crate) fn render_tag(
+    font: &FontArc,
+    badge: &str,
+    spans: &[(&str, [u8; 4])],
+    font_size: f32,
+    world_height: f32,
+    badge_background: [u8; 4],
+    badge_color: [u8; 4],
+) -> RenderedLabelText {
+    let scale = PxScale::from(font_size);
+    let scaled_font = font.as_scaled(scale);
+    let height = (scaled_font.height() * 1.45).ceil().max(2.0);
+    let radius = height * 0.5;
+    let badge_text_width = line_width(font, scale, badge);
+    let badge_width = (badge_text_width + height * 0.9).max(height);
+    let gap = height * 0.3;
+    let span_widths: Vec<f32> = spans
+        .iter()
+        .map(|(text, _)| line_width(font, scale, text))
+        .collect();
+    let text_width: f32 = span_widths.iter().sum();
+    // Room for the halo around the text.
+    let halo = 5.0;
+    let width = (badge_width + gap + text_width + halo).ceil();
+    let mut rgba = RgbaImage::from_pixel(width as u32, height as u32, Rgba([0, 0, 0, 0]));
+    // Signed distance to the pill's edge, antialiased over one pixel.
+    for y in 0..rgba.height() {
+        for x in 0..(badge_width.ceil() as u32).min(rgba.width()) {
+            let point = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+            let nearest_x = point.x.clamp(radius, badge_width - radius);
+            let distance = point.distance(Vec2::new(nearest_x, radius)) - radius;
+            blend_label_pixel(
+                &mut rgba,
+                x as i32,
+                y as i32,
+                0.5 - distance,
+                badge_background,
+            );
+        }
+    }
+    let baseline = (height - scaled_font.height()) * 0.5 + scaled_font.ascent();
+    draw_text_line(
+        &mut rgba,
+        font,
+        scale,
+        badge,
+        (badge_width - badge_text_width) * 0.5,
+        baseline,
+        badge_color,
+    );
+    let mut x = badge_width + gap;
+    for ((text, color), span_width) in spans.iter().zip(&span_widths) {
+        draw_shadowed_text_line(
+            &mut rgba,
+            font,
+            scale,
+            text,
+            x,
+            baseline,
+            *color,
+            LabelShadow::Halo,
+        );
+        x += span_width;
+    }
+    let world_size = Vec2::new(width, height) * (world_height / height);
+    RenderedLabelText {
+        image: Image::new(
+            Extent3d {
+                width: rgba.width(),
+                height: rgba.height(),
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            rgba.into_raw(),
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        ),
+        world_size,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_shadowed_text_line(
     image: &mut RgbaImage,
     font: &FontArc,
@@ -915,8 +1053,9 @@ fn draw_shadowed_text_line(
     x: f32,
     baseline: f32,
     color: [u8; 4],
+    shadow: LabelShadow,
 ) {
-    for (offset_x, offset_y, alpha) in [(3.0, 3.0, 155), (1.5, 1.5, 220)] {
+    for &(offset_x, offset_y, alpha) in shadow_passes(shadow) {
         draw_text_line(
             image,
             font,
@@ -968,7 +1107,7 @@ fn draw_text_line(
 /// transparent neighbor's `rgb = 0`, darkening the edge into a visible fringe
 /// whenever the label is viewed up close; premultiplied edge texels already
 /// carry correctly-scaled color so filtering between them stays correct.
-fn blend_label_pixel(
+pub(crate) fn blend_label_pixel(
     image: &mut RgbaImage,
     glyph_x: i32,
     glyph_y: i32,
@@ -1334,6 +1473,14 @@ fn face_direction(face: AxisGizmoFace) -> Vec3 {
         AxisGizmoFace::NegativeZ => Vec3::NEG_Z,
     }
 }
+
+/// Text naming a value along each axis (X, Y, Z): the gizmo's axis colors,
+/// lightened to read over the dark halo labels carry.
+pub(crate) const AXIS_TEXT_COLORS: [[u8; 4]; 3] = [
+    [255, 132, 142, 255],
+    [132, 242, 156, 255],
+    [138, 178, 255, 255],
+];
 
 fn axis_color(face: AxisGizmoFace) -> Color {
     let base = match axis_index(face) {

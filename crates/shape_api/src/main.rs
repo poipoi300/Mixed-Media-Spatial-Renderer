@@ -49,28 +49,10 @@ struct ProjectionRequest {
     roots: Vec<String>,
     control_values: ControlValues,
     activated: Option<String>,
-    coordinate_spacing: f32,
-    sprite_world_height: f32,
     limit: usize,
 }
 
 impl ProjectionRequest {
-    fn coordinate_spacing(&self) -> f32 {
-        if self.coordinate_spacing > 0.0 {
-            self.coordinate_spacing
-        } else {
-            6.0
-        }
-    }
-
-    fn sprite_world_height(&self) -> f32 {
-        if self.sprite_world_height > 0.0 {
-            self.sprite_world_height
-        } else {
-            4.0
-        }
-    }
-
     fn limit(&self) -> usize {
         if self.limit == 0 {
             10_000
@@ -201,13 +183,7 @@ fn project(state: &Mutex<ServerState>, body: &ProjectionRequest) -> CatalogSnaps
         state.shuffle_round += 1;
     }
     let controls = Controls::from_values(&body.control_values, body.activated.as_deref());
-    build_snapshot(
-        &state,
-        &controls,
-        body.coordinate_spacing(),
-        body.sprite_world_height(),
-        body.limit(),
-    )
+    build_snapshot(&state, &controls, body.limit())
 }
 
 fn encode(snapshot: &CatalogSnapshot) -> String {
@@ -251,8 +227,6 @@ mod tests {
     #[test]
     fn a_request_body_falls_back_to_workable_defaults() {
         let request = ProjectionRequest::default();
-        assert_eq!(request.coordinate_spacing(), 6.0);
-        assert_eq!(request.sprite_world_height(), 4.0);
         assert_eq!(request.limit(), 10_000);
     }
 
@@ -262,9 +236,6 @@ mod tests {
             "roots": ["E:/images"],
             "control_values": {"shape": "cube", "radius": 30.0, "jitter": true},
             "activated": "randomize",
-            "coordinate_spacing": 6.0,
-            "duplicate_spacing": 0.8,
-            "sprite_world_height": 4.68,
             "offset": 0,
             "limit": 5000
         }"#;

@@ -1,6 +1,19 @@
+mod animations_panel;
 mod context_menu;
 mod control_panel;
+mod controls_sheet;
+mod edit_panel;
+mod folder_panel;
+mod input_bindings;
+mod look_crosshair;
+mod search_panel;
+mod selection_box;
+mod text_entry;
 
+pub use animations_panel::{
+    handle_animation_buttons, update_animation_button_colors, update_animation_panels,
+    update_animation_text, Animation, AnimationSettings,
+};
 pub use context_menu::{
     ContextMenu, ContextMenuItem, ContextMenuModel, ContextMenuOption, ContextMenuPlugin,
     ContextMenuSection, ContextMenuSystems,
@@ -14,12 +27,47 @@ pub use control_panel::{
     ControlWidgetText, FocusOwner, PendingSubmit,
 };
 
+pub use folder_panel::{
+    handle_folder_buttons, update_folder_button_colors, update_folder_panels, update_folder_text,
+    FolderControls, FolderDisplay, FolderRequest,
+};
+
+pub use controls_sheet::{
+    handle_controls_sheet_buttons, scroll_controls_sheet, update_controls_sheet,
+    update_controls_sheet_colors, ControlsSheetState,
+};
+pub use edit_panel::{handle_edit_buttons, update_edit_button_colors, EditControls, EditRequest};
+pub use input_bindings::{
+    capture_binding, update_control_input_state, update_typing_focus, Action, ActionCategory,
+    ActionContext, BindingConflict, BindingEditor, BindingRefusal, BindingSlot, BindingSource,
+    Chord, ControlBindings, ControlInput, ControlInputState, DefaultBinding, Gesture, HoldMode,
+    Input, Modifier, Modifiers, Slots, TypingFocus, SLOT_COUNT,
+};
+pub use look_crosshair::{spawn_look_crosshair, LookCrosshair};
+pub use search_panel::{
+    apply_search_typing, handle_search_buttons, update_search_button_colors, update_search_panels,
+    update_search_text, SearchControls, SearchRequest,
+};
+pub use selection_box::{
+    spawn_selection_box, update_selection_box, SelectionBox, SelectionBoxNode,
+};
+pub use text_entry::{
+    handle_text_entry_keyboard, update_rename_prompt, RenamePromptPart, TextEntry, TextEntryBox,
+    TextEntryTarget,
+};
+
 use std::collections::{HashMap, VecDeque};
 
 use bevy::prelude::*;
 use bevy::ui::{FocusPolicy, RelativeCursorPosition};
 
+use animations_panel::spawn_animations_screen;
 use control_panel::spawn_control_panel_pill;
+use controls_sheet::spawn_controls_sheet;
+use edit_panel::spawn_edit_pill;
+use folder_panel::spawn_folder_pill;
+use search_panel::spawn_search_pill;
+use text_entry::spawn_rename_prompt;
 
 const MIN_BASE_SPEED: f32 = 0.05;
 const MAX_BASE_SPEED: f32 = 5_000.0;
@@ -137,6 +185,8 @@ pub struct BillboardControls {
     /// Manually dragged billboards snap to the coordinate-spacing grid when
     /// the drag is released.
     pub snap_to_grid: bool,
+    /// The billboard under the pointer grows a little.
+    pub grow_on_hover: bool,
 }
 
 #[derive(Resource, Default)]
@@ -385,6 +435,8 @@ pub enum PauseScreen {
     Main,
     Settings,
     CatalogOptions,
+    Controls,
+    Animations,
 }
 
 #[derive(Resource, Default)]
@@ -466,6 +518,59 @@ impl Default for PlaybackSettings {
     }
 }
 
+/// App-wide settings for the view, from the pause-menu settings screen.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct ViewSettings {
+    /// Each catalog view opens with the camera where it was left there:
+    /// position, direction and base speed.
+    pub remember_camera: bool,
+}
+
+impl Default for ViewSettings {
+    fn default() -> Self {
+        Self {
+            remember_camera: true,
+        }
+    }
+}
+
+/// Whether the interface (panels, the axis gizmo, video control strips)
+/// is hidden, for a clear view of the scene. Menus the user opens still
+/// show. Not kept between sessions.
+#[derive(Resource, Default)]
+pub struct HudVisibility {
+    pub hidden: bool,
+}
+
+/// The panels around the edge of the window, hidden with the interface.
+#[derive(Component)]
+pub struct HudPanels;
+
+/// Hides or shows the interface when its key is pressed outside a menu.
+pub fn toggle_hud(
+    input: ControlInput,
+    pause_menu: Res<PauseMenuState>,
+    mut hud: ResMut<HudVisibility>,
+) {
+    if !pause_menu.paused && input.just_pressed(Action::ToggleHud) {
+        hud.hidden = !hud.hidden;
+    }
+}
+
+pub fn update_hud_panels(
+    hud: Res<HudVisibility>,
+    mut panels: Query<&mut Visibility, With<HudPanels>>,
+) {
+    let visibility = if hud.hidden {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for mut panel in &mut panels {
+        panel.set_if_neq(visibility);
+    }
+}
+
 #[derive(Resource)]
 pub struct StartMenuState {
     pub roots: Vec<String>,
@@ -479,6 +584,7 @@ pub struct StartMenuState {
     load_requested: bool,
     use_current_requested: bool,
     clear_requested: bool,
+    reset_layout_requested: bool,
     remove_requested: Option<usize>,
 }
 
@@ -497,9 +603,22 @@ pub enum ViewerUiButton {
     SetBillboardAxis(BillboardFacingAxis),
     ToggleBillboardCoordinates,
     ToggleBillboardGridSnap,
+    ToggleBillboardHoverGrowth,
     TextureLower,
     TextureHigher,
     SetTextureBudgetFromSlider,
+    ToggleFolderPill,
+    OpenAllFolders,
+    CloseAllFolders,
+    ToggleFolderTags,
+    ToggleFolderCloseIcons,
+    ToggleFolderBackgrounds,
+    UndoArrangement,
+    RedoArrangement,
+    ToggleSearchPill,
+    FocusSearch,
+    SelectSearchMatches,
+    NextSearchMatch,
     ToggleDebugPill,
     StartBenchmark,
     CycleBenchmarkDuration,
@@ -508,14 +627,21 @@ pub enum ViewerUiButton {
     PauseSettings,
     PauseBack,
     PauseCatalogOptions,
+    PauseControls,
+    PauseAnimations,
     PauseQuit,
     SetResolutionScaleFromSlider,
     SetAudioVolumeFromSlider,
     ToggleRememberPlaybackPosition,
+    ToggleRememberCamera,
+    ToggleAnimationsDisabled,
+    ToggleAnimation(Animation),
+    SetAnimationScaleFromSlider,
     StartAddFolder,
     StartClearFolders,
     StartLoadFolders,
     StartUseCurrentCatalog,
+    StartResetLayout,
     StartRemoveFolder(usize),
 }
 
@@ -531,7 +657,15 @@ pub enum ViewerUiText {
     BillboardsDetails,
     BillboardCoordinatesMark,
     BillboardGridSnapMark,
+    BillboardHoverGrowthMark,
     BillboardTextureBudgetSummary,
+    FolderSummary,
+    FolderTagsMark,
+    FolderCloseIconsMark,
+    FolderBackgroundsMark,
+    SearchSummary,
+    SearchQuery,
+    SearchResults,
     DebugSummary,
     BenchmarkStatus,
     BenchmarkDetails,
@@ -540,6 +674,10 @@ pub enum ViewerUiText {
     ResolutionSummary,
     AudioVolumeSummary,
     RememberPlaybackPositionMark,
+    RememberCameraMark,
+    AnimationsDisabledMark,
+    AnimationScaleSummary,
+    AnimationMark(Animation),
     StartRoots,
     StartStatus,
     StartFolderPath(usize),
@@ -556,6 +694,11 @@ pub enum ViewerUiPanel {
     BillboardsPill,
     BillboardsExpanded,
     BillboardTextureBudgetFill,
+    FolderPill,
+    FolderExpanded,
+    SearchPill,
+    SearchExpanded,
+    EditPill,
     DebugPill,
     DebugExpanded,
     PerformancePill,
@@ -563,8 +706,11 @@ pub enum ViewerUiPanel {
     PauseOverlay,
     PauseMain,
     PauseSettings,
+    PauseControls,
+    PauseAnimations,
     ResolutionScaleFill,
     AudioVolumeFill,
+    AnimationScaleFill,
     StartOverlay,
     StartFolderRow(usize),
 }
@@ -621,6 +767,11 @@ impl NavigationSettings {
 
     pub fn retarget_reference_distance(&mut self, reference_distance: f32) {
         self.reference_distance = reference_distance.max(1.0);
+    }
+
+    /// Sets the base speed, within the range the speed buttons keep to.
+    pub fn set_base_speed(&mut self, base_speed: f32) {
+        self.base_speed = base_speed.clamp(MIN_BASE_SPEED, MAX_BASE_SPEED);
     }
 
     fn slow_down(&mut self) {
@@ -924,6 +1075,7 @@ impl BillboardControls {
             billboards_pill_expanded: false,
             show_coordinates: false,
             snap_to_grid: false,
+            grow_on_hover: true,
         }
     }
 
@@ -977,6 +1129,10 @@ impl BillboardControls {
     fn toggle_snap_to_grid(&mut self) {
         self.snap_to_grid = !self.snap_to_grid;
     }
+
+    fn toggle_grow_on_hover(&mut self) {
+        self.grow_on_hover = !self.grow_on_hover;
+    }
 }
 
 impl DebugSettings {
@@ -1015,8 +1171,21 @@ impl PauseMenuState {
     pub fn back(&mut self) {
         match self.screen {
             PauseScreen::Main => self.resume(),
-            PauseScreen::Settings => self.screen = PauseScreen::Main,
+            PauseScreen::Settings | PauseScreen::Controls | PauseScreen::Animations => {
+                self.screen = PauseScreen::Main
+            }
             PauseScreen::CatalogOptions => self.screen = PauseScreen::Settings,
+        }
+    }
+
+    /// The controls shortcut: opens the menu on the controls sheet, or
+    /// closes it from there.
+    pub fn toggle_controls(&mut self) {
+        if self.paused && self.screen == PauseScreen::Controls {
+            self.resume();
+        } else {
+            self.paused = true;
+            self.screen = PauseScreen::Controls;
         }
     }
 
@@ -1146,6 +1315,7 @@ impl Default for StartMenuState {
             load_requested: false,
             use_current_requested: false,
             clear_requested: false,
+            reset_layout_requested: false,
             remove_requested: None,
         }
     }
@@ -1203,6 +1373,11 @@ impl StartMenuState {
         let requested = self.clear_requested;
         self.clear_requested = false;
         requested
+    }
+
+    /// Whether "Reset layout" was pressed since this was last called.
+    pub fn take_reset_layout_request(&mut self) -> bool {
+        std::mem::take(&mut self.reset_layout_requested)
     }
 
     pub fn take_remove_request(&mut self) -> Option<usize> {
@@ -1308,15 +1483,18 @@ pub fn spawn_viewer_ui(commands: &mut Commands) {
         ))
         .with_children(|parent| {
             parent
-                .spawn(Node {
-                    position_type: PositionType::Relative,
-                    width: Val::VMin(177.7778),
-                    height: Val::VMin(100.0),
-                    max_width: Val::Percent(100.0),
-                    max_height: Val::Percent(100.0),
-                    aspect_ratio: Some(16.0 / 9.0),
-                    ..default()
-                })
+                .spawn((
+                    Node {
+                        position_type: PositionType::Relative,
+                        width: Val::VMin(177.7778),
+                        height: Val::VMin(100.0),
+                        max_width: Val::Percent(100.0),
+                        max_height: Val::Percent(100.0),
+                        aspect_ratio: Some(16.0 / 9.0),
+                        ..default()
+                    },
+                    HudPanels,
+                ))
                 .with_children(|bounds| {
                     // Right-hand columns align their pills to the right edge
                     // of the 16:9 frame so collapsed pills hug the frame
@@ -1351,6 +1529,9 @@ pub fn spawn_viewer_ui(commands: &mut Commands) {
                             spawn_header(view, "View");
                             spawn_control_panel_pill(view);
                             spawn_billboards_pill(view);
+                            spawn_folder_pill(view);
+                            spawn_search_pill(view);
+                            spawn_edit_pill(view);
                         });
                     bounds
                         .spawn(Node {
@@ -1369,6 +1550,7 @@ pub fn spawn_viewer_ui(commands: &mut Commands) {
                             spawn_performance_pill(developer);
                         });
                 });
+            spawn_rename_prompt(parent);
             spawn_pause_overlay(parent);
             spawn_start_overlay(parent);
         });
@@ -1438,6 +1620,7 @@ pub fn handle_billboard_buttons(
                 billboard_controls.toggle_show_coordinates()
             }
             ViewerUiButton::ToggleBillboardGridSnap => billboard_controls.toggle_snap_to_grid(),
+            ViewerUiButton::ToggleBillboardHoverGrowth => billboard_controls.toggle_grow_on_hover(),
             ViewerUiButton::TextureLower => billboard_controls.lower_texture_limit(),
             ViewerUiButton::TextureHigher => billboard_controls.raise_texture_limit(),
             _ => {}
@@ -1488,6 +1671,7 @@ pub fn handle_performance_buttons(
 pub fn handle_pause_menu_buttons(
     mut pause_menu: ResMut<PauseMenuState>,
     mut playback_settings: ResMut<PlaybackSettings>,
+    mut view_settings: ResMut<ViewSettings>,
     mut app_exit: EventWriter<AppExit>,
     interaction_query: ButtonInteractionQuery,
 ) {
@@ -1502,8 +1686,13 @@ pub fn handle_pause_menu_buttons(
             // options screen's back arrow: both just step back one level.
             ViewerUiButton::PauseBack => pause_menu.back(),
             ViewerUiButton::PauseCatalogOptions => pause_menu.open_catalog_options(),
+            ViewerUiButton::PauseControls => pause_menu.screen = PauseScreen::Controls,
+            ViewerUiButton::PauseAnimations => pause_menu.screen = PauseScreen::Animations,
             ViewerUiButton::ToggleRememberPlaybackPosition => {
                 playback_settings.remember_position = !playback_settings.remember_position;
+            }
+            ViewerUiButton::ToggleRememberCamera => {
+                view_settings.remember_camera = !view_settings.remember_camera;
             }
             ViewerUiButton::PauseQuit => {
                 app_exit.send(AppExit::Success);
@@ -1585,6 +1774,7 @@ pub fn handle_start_menu_buttons(
             ViewerUiButton::StartClearFolders => start_menu.clear_requested = true,
             ViewerUiButton::StartLoadFolders => start_menu.load_requested = true,
             ViewerUiButton::StartUseCurrentCatalog => start_menu.use_current_requested = true,
+            ViewerUiButton::StartResetLayout => start_menu.reset_layout_requested = true,
             ViewerUiButton::StartRemoveFolder(index) => start_menu.remove_requested = Some(*index),
             _ => {}
         }
@@ -1664,6 +1854,13 @@ inview {:>5}/{:<5} textured",
                     String::new()
                 };
             }
+            ViewerUiText::BillboardHoverGrowthMark => {
+                **text = if billboard_controls.grow_on_hover {
+                    "X".to_owned()
+                } else {
+                    String::new()
+                };
+            }
             _ => {}
         }
     }
@@ -1720,6 +1917,7 @@ pub fn update_resolution_text(
 pub fn update_audio_text(
     audio_settings: Res<AudioSettings>,
     playback_settings: Res<PlaybackSettings>,
+    view_settings: Res<ViewSettings>,
     mut text_query: UiTextQuery,
 ) {
     for (mut text, text_kind) in &mut text_query {
@@ -1729,6 +1927,13 @@ pub fn update_audio_text(
             }
             ViewerUiText::RememberPlaybackPositionMark => {
                 **text = if playback_settings.remember_position {
+                    "X".to_owned()
+                } else {
+                    String::new()
+                };
+            }
+            ViewerUiText::RememberCameraMark => {
+                **text = if view_settings.remember_camera {
                     "X".to_owned()
                 } else {
                     String::new()
@@ -1872,6 +2077,14 @@ pub fn update_pause_panels(
                 node.display =
                     display_if(pause_menu.paused && pause_menu.screen == PauseScreen::Settings);
             }
+            ViewerUiPanel::PauseControls => {
+                node.display =
+                    display_if(pause_menu.paused && pause_menu.screen == PauseScreen::Controls);
+            }
+            ViewerUiPanel::PauseAnimations => {
+                node.display =
+                    display_if(pause_menu.paused && pause_menu.screen == PauseScreen::Animations);
+            }
             ViewerUiPanel::ResolutionScaleFill => {
                 node.width = Val::Percent(render_resolution.slider_percent());
             }
@@ -1939,6 +2152,7 @@ pub fn update_billboard_button_colors(
             ViewerUiButton::SetBillboardAxis(axis) => billboard_facing.axis == *axis,
             ViewerUiButton::ToggleBillboardCoordinates => billboard_controls.show_coordinates,
             ViewerUiButton::ToggleBillboardGridSnap => billboard_controls.snap_to_grid,
+            ViewerUiButton::ToggleBillboardHoverGrowth => billboard_controls.grow_on_hover,
             ViewerUiButton::TextureLower | ViewerUiButton::TextureHigher => false,
             _ => continue,
         };
@@ -1974,15 +2188,19 @@ pub fn update_performance_button_colors(mut button_query: UiButtonColorQuery) {
 pub fn update_pause_button_colors(
     pause_menu: Res<PauseMenuState>,
     playback_settings: Res<PlaybackSettings>,
+    view_settings: Res<ViewSettings>,
     mut button_query: UiButtonColorQuery,
 ) {
     for (button, interaction, color) in &mut button_query {
         let active = match button {
             ViewerUiButton::PauseSettings => pause_menu.screen == PauseScreen::Settings,
             ViewerUiButton::ToggleRememberPlaybackPosition => playback_settings.remember_position,
+            ViewerUiButton::ToggleRememberCamera => view_settings.remember_camera,
             ViewerUiButton::PauseResume
             | ViewerUiButton::PauseBack
             | ViewerUiButton::PauseCatalogOptions
+            | ViewerUiButton::PauseControls
+            | ViewerUiButton::PauseAnimations
             | ViewerUiButton::PauseQuit => false,
             _ => continue,
         };
@@ -2013,6 +2231,7 @@ pub fn update_start_button_colors(
             | ViewerUiButton::StartClearFolders
             | ViewerUiButton::StartLoadFolders
             | ViewerUiButton::StartUseCurrentCatalog
+            | ViewerUiButton::StartResetLayout
             | ViewerUiButton::StartRemoveFolder(_) => {
                 if start_menu.busy() {
                     set_disabled_button_color(color);
@@ -2174,8 +2393,12 @@ fn spawn_pause_overlay(parent: &mut ChildBuilder) {
                     spawn_menu_title(menu, "Paused");
                     spawn_menu_button(menu, ViewerUiButton::PauseResume, "Resume");
                     spawn_menu_button(menu, ViewerUiButton::PauseSettings, "Settings");
+                    spawn_menu_button(menu, ViewerUiButton::PauseAnimations, "Animations");
+                    spawn_menu_button(menu, ViewerUiButton::PauseControls, "Controls");
                     spawn_menu_button(menu, ViewerUiButton::PauseQuit, "Quit");
                 });
+            spawn_controls_sheet(overlay);
+            spawn_animations_screen(overlay);
             overlay
                 .spawn(menu_panel(ViewerUiPanel::PauseSettings, 340.0))
                 .with_children(|settings| {
@@ -2198,6 +2421,12 @@ fn spawn_pause_overlay(parent: &mut ChildBuilder) {
                         ViewerUiText::RememberPlaybackPositionMark,
                         "Remember playback position",
                     );
+                    spawn_checkbox_row(
+                        settings,
+                        ViewerUiButton::ToggleRememberCamera,
+                        ViewerUiText::RememberCameraMark,
+                        "Remember camera position per catalog",
+                    );
                     spawn_menu_button(
                         settings,
                         ViewerUiButton::PauseCatalogOptions,
@@ -2210,7 +2439,7 @@ fn spawn_pause_overlay(parent: &mut ChildBuilder) {
 
 /// A settings row made of a value label above a draggable slider whose fill
 /// panel is resized each frame from the setting it displays.
-fn spawn_settings_slider(
+pub(crate) fn spawn_settings_slider(
     parent: &mut ChildBuilder,
     summary: ViewerUiText,
     slider: ViewerUiButton,
@@ -2316,6 +2545,11 @@ fn spawn_start_overlay(parent: &mut ChildBuilder) {
                         ViewerUiButton::StartUseCurrentCatalog,
                         "Use current catalog",
                     );
+                    spawn_menu_button(
+                        menu,
+                        ViewerUiButton::StartResetLayout,
+                        "Reset layout (as first opened)",
+                    );
                 });
         });
 }
@@ -2375,7 +2609,7 @@ fn spawn_start_folder_row(parent: &mut ChildBuilder, row_index: usize) {
         });
 }
 
-fn menu_panel(
+pub(crate) fn menu_panel(
     panel: ViewerUiPanel,
     width: f32,
 ) -> (
@@ -2406,7 +2640,7 @@ fn menu_panel(
     )
 }
 
-fn spawn_menu_title(parent: &mut ChildBuilder, label: &str) {
+pub(crate) fn spawn_menu_title(parent: &mut ChildBuilder, label: &str) {
     parent.spawn((
         Text::new(label),
         TextFont {
@@ -2465,7 +2699,7 @@ fn spawn_menu_header_with_back(parent: &mut ChildBuilder, label: &str) {
         });
 }
 
-fn spawn_menu_button(parent: &mut ChildBuilder, action: ViewerUiButton, label: &str) {
+pub(crate) fn spawn_menu_button(parent: &mut ChildBuilder, action: ViewerUiButton, label: &str) {
     parent
         .spawn((
             Button,
@@ -2561,6 +2795,12 @@ fn spawn_billboards_pill(parent: &mut ChildBuilder) {
                         ViewerUiButton::ToggleBillboardGridSnap,
                         ViewerUiText::BillboardGridSnapMark,
                         "Snap drag to grid",
+                    );
+                    spawn_checkbox_row(
+                        expanded,
+                        ViewerUiButton::ToggleBillboardHoverGrowth,
+                        ViewerUiText::BillboardHoverGrowthMark,
+                        "Grow on hover",
                     );
                     spawn_title(expanded, "Facing axis");
                     spawn_button_row(
@@ -2745,11 +2985,22 @@ pub(crate) fn spawn_button_row(parent: &mut ChildBuilder, buttons: &[(ViewerUiBu
         });
 }
 
-fn spawn_checkbox_row(
+pub(crate) fn spawn_checkbox_row(
     parent: &mut ChildBuilder,
     action: ViewerUiButton,
     mark_text: ViewerUiText,
     label: &str,
+) {
+    spawn_checkbox_row_with_label(parent, action, mark_text, label, ());
+}
+
+/// A checkbox row whose label text also carries `label_bundle`.
+pub(crate) fn spawn_checkbox_row_with_label(
+    parent: &mut ChildBuilder,
+    action: ViewerUiButton,
+    mark_text: ViewerUiText,
+    label: &str,
+    label_bundle: impl Bundle,
 ) {
     parent
         .spawn(Node {
@@ -2790,11 +3041,12 @@ fn spawn_checkbox_row(
                     ..default()
                 },
                 TextColor(Color::srgb(0.86, 0.90, 0.96)),
+                label_bundle,
             ));
         });
 }
 
-fn spawn_button(parent: &mut ChildBuilder, action: ViewerUiButton, label: &str) {
+pub(crate) fn spawn_button(parent: &mut ChildBuilder, action: ViewerUiButton, label: &str) {
     parent
         .spawn((
             Button,
@@ -2920,7 +3172,7 @@ pub(crate) fn set_button_color(
     *color = button_color(active, hovered).into();
 }
 
-fn set_disabled_button_color(mut color: Mut<BackgroundColor>) {
+pub(crate) fn set_disabled_button_color(mut color: Mut<BackgroundColor>) {
     *color = disabled_button_color().into();
 }
 
@@ -3084,20 +3336,26 @@ mod tests {
         app.insert_resource(BenchmarkControls::default());
         app.insert_resource(PerformanceMetrics::default());
         app.insert_resource(PauseMenuState::default());
+        app.insert_resource(ViewSettings::default());
         app.insert_resource(RenderResolutionSettings::default());
         app.insert_resource(AudioSettings::default());
         app.insert_resource(PlaybackSettings::default());
         app.insert_resource(StartMenuState::default());
+        app.insert_resource(FolderControls::default());
+        app.insert_resource(ControlBindings::default());
+        app.init_resource::<AnimationSettings>();
         app.add_systems(
             Update,
             (
                 update_navigation_text,
                 update_control_text,
                 update_billboard_text,
+                update_folder_text,
                 update_debug_text,
                 update_performance_text,
                 update_resolution_text,
                 update_start_text,
+                update_animation_text,
             )
                 .chain(),
         );
@@ -3107,10 +3365,12 @@ mod tests {
                 update_navigation_panels,
                 update_control_panels,
                 update_billboard_panels,
+                update_folder_panels,
                 update_debug_panels,
                 update_performance_panels,
                 update_pause_panels,
                 update_start_panels,
+                update_animation_panels,
                 update_perf_graph_bars,
             )
                 .chain(),
@@ -3121,11 +3381,13 @@ mod tests {
                 update_navigation_button_colors,
                 update_control_button_colors,
                 update_billboard_button_colors,
+                update_folder_button_colors,
                 update_debug_button_colors,
                 update_performance_button_colors,
                 update_pause_button_colors,
                 update_resolution_button_colors,
                 update_start_button_colors,
+                update_animation_button_colors,
             )
                 .chain(),
         );

@@ -5,6 +5,12 @@
 //! control-panel schema in [`controls`]. Nothing here is specific to any
 //! particular server: the viewer sends folder roots plus a map of control
 //! values, and receives points plus the panel that produced them.
+//!
+//! Positions are in cube units: every billboard fills a 1x1x1 cube, and a
+//! server lays cubes out touching. A point may also name the group it
+//! belongs to (see [`PointGroup`]); the viewer shows a group of several
+//! points as one folder the user opens and closes, and lays the groups out
+//! itself.
 
 mod controls;
 
@@ -37,7 +43,13 @@ pub struct HealthResponse {
 pub struct ProjectionPoint {
     pub image_id: usize,
     pub path: String,
+    /// Cube center in cube units, with neighbouring cubes touching and
+    /// every group laid out open. A viewer that lays groups out itself uses
+    /// `group` instead.
     pub position: [f32; 3],
+    /// The group this point belongs to; `None` from a server without groups.
+    #[serde(default)]
+    pub group: Option<PointGroup>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub media_type: String,
@@ -48,16 +60,32 @@ pub struct ProjectionPoint {
     pub coordinate_labels: [Option<String>; 3],
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// Where a point sits among the points it is grouped with, for example every
+/// image sharing one coordinate value.
+///
+/// Groups form a grid: along each axis a group occupies one slot, `index`,
+/// and its points pack into a block of cubes centered on the slot. The
+/// viewer sizes every slot to what it currently shows there, so a closed
+/// folder takes one cube and an open one its whole block.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PointGroup {
+    /// Names the group across snapshots, which the slot rank cannot do: a
+    /// value discovered later shifts the ranks of everything after it.
+    pub key: String,
+    /// The group's slot along each axis, counting from 0 at the low end.
+    pub index: [u32; 3],
+    /// The point's cube center relative to the center of its group's block,
+    /// in cube units.
+    pub offset: [f32; 3],
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProjectionPage {
     /// What each world axis represents, as the server names it. The gizmo and
     /// billboard coordinate labels render these directly, so the viewer needs
     /// no notion of what produced the layout.
     #[serde(default)]
     pub axis_labels: [Option<String>; 3],
-    pub coordinate_spacing: f32,
-    pub duplicate_spacing: f32,
-    pub sprite_world_height: f32,
     pub offset: usize,
     pub limit: usize,
     pub total: usize,
@@ -76,9 +104,6 @@ pub struct ProjectionRequest {
     pub roots: Vec<String>,
     pub control_values: ControlValues,
     pub activated: Option<String>,
-    pub coordinate_spacing: f32,
-    pub duplicate_spacing: f32,
-    pub sprite_world_height: f32,
     pub offset: usize,
     pub limit: usize,
 }
@@ -86,19 +111,11 @@ pub struct ProjectionRequest {
 impl ProjectionRequest {
     /// A request with no controls set, which is what the viewer sends before
     /// a server has described its panel.
-    pub fn new(
-        coordinate_spacing: f32,
-        duplicate_spacing: f32,
-        sprite_world_height: f32,
-        limit: usize,
-    ) -> Self {
+    pub fn new(limit: usize) -> Self {
         Self {
             roots: Vec::new(),
             control_values: ControlValues::new(),
             activated: None,
-            coordinate_spacing,
-            duplicate_spacing,
-            sprite_world_height,
             offset: 0,
             limit,
         }
@@ -240,8 +257,7 @@ mod tests {
         serde_json::json!({
             "kind": "snapshot", "roots": ["fixture"], "complete": complete,
             "panel": {"revision": 1, "title": "Axes", "summary": "0 pts", "widgets": []},
-            "projection": {"axis_labels": [null,null,null], "coordinate_spacing": 6.0,
-                "duplicate_spacing": 0.8, "sprite_world_height": 4.68,
+            "projection": {"axis_labels": [null,null,null],
                 "offset": 0, "limit": 1, "total": 0, "points": []}
         })
         .to_string()
@@ -249,7 +265,7 @@ mod tests {
     }
 
     fn request() -> ProjectionRequest {
-        ProjectionRequest::new(6.0, 0.8, 4.68, 100).with_roots(vec!["fixture".to_owned()])
+        ProjectionRequest::new(100).with_roots(vec!["fixture".to_owned()])
     }
 
     #[test]
@@ -368,8 +384,7 @@ mod tests {
                 .unwrap();
             let body = serde_json::json!({
                 "panel": {"revision": 1, "widgets": []},
-                "projection": {"axis_labels": ["Seed", null, null], "coordinate_spacing": 6.0,
-                    "duplicate_spacing": 0.8, "sprite_world_height": 4.68,
+                "projection": {"axis_labels": ["Seed", null, null],
                     "offset": 0, "limit": 1, "total": 0, "points": []}
             })
             .to_string();

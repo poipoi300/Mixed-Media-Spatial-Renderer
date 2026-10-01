@@ -212,6 +212,22 @@ impl VideoPlaybackState {
         )
     }
 
+    /// Whether the video shows the frame for `time_seconds`: what a clock
+    /// starting there waits for, so its picture and sound begin together.
+    /// A video with nothing decoding for it, or one that cannot decode, has
+    /// nothing to wait for.
+    pub fn shows_frame_at(&self, image_id: usize, time_seconds: f32) -> bool {
+        let Some(active) = self.active.get(&image_id) else {
+            return true;
+        };
+        if active.broken {
+            return true;
+        }
+        active.timing.is_some_and(|timing| {
+            active.applied_frame_index == Some(active.target_frame_index(timing, time_seconds))
+        })
+    }
+
     /// ffmpeg frame streams currently running across all videos.
     pub fn stream_count(&self) -> usize {
         self.active
@@ -251,10 +267,7 @@ impl VideoPlaybackState {
             return None;
         }
         active.choose_subtitles(subtitles);
-        let mut target = timing.frame_index(position.time_seconds);
-        if let Some(last_frame_index) = active.last_frame_index {
-            target = target.min(last_frame_index);
-        }
+        let target = active.target_frame_index(timing, position.time_seconds);
         if active.applied_frame_index == Some(target)
             && (!position.advancing || active.last_frame_index == Some(target))
         {
@@ -300,6 +313,14 @@ impl ActiveVideoPlayback {
             ));
         }
         self.timing
+    }
+
+    /// The frame a clock at `time_seconds` shows: capped at the file's last
+    /// frame once a stream found it.
+    fn target_frame_index(&self, timing: VideoTiming, time_seconds: f32) -> u64 {
+        let target = timing.frame_index(time_seconds);
+        self.last_frame_index
+            .map_or(target, |last_frame_index| target.min(last_frame_index))
     }
 
     /// Switches the subtitles drawn into the frames. The shown frame carries
@@ -612,6 +633,36 @@ mod tests {
         assert!(!active.stream_must_restart(video_timing, 9, true));
         assert!(active.stream_must_restart(video_timing, 9, false));
         assert!(active.stream_must_restart(video_timing, 5, true));
+    }
+
+    #[test]
+    fn a_video_shows_the_frame_for_a_time_once_that_frame_is_applied() {
+        let mut state = VideoPlaybackState::new(60.0);
+        state.activate(VIDEO, TEST_PATH, 1);
+        // Unprobed: no frame can show yet.
+        assert!(!state.shows_frame_at(VIDEO, 0.0));
+
+        let mut state = state_with_probed_video(24.0);
+        let video_timing = timing(&state);
+        let sender = attach_stream(&mut state, 0);
+        assert!(!state.shows_frame_at(VIDEO, 0.0));
+        send_frames(&sender, 2);
+        let second_frame = video_timing.frame_seconds(1);
+        assert!(take(&mut state, at(second_frame, false)).is_some());
+        assert!(state.shows_frame_at(VIDEO, second_frame));
+        assert!(!state.shows_frame_at(VIDEO, 0.0));
+
+        // Past the end, the last frame is the one shown.
+        sender
+            .send(StreamItem::End(StreamEnd::Finished))
+            .expect("stream listening");
+        take(&mut state, at(video_timing.frame_seconds(10), true));
+        assert!(state.shows_frame_at(VIDEO, video_timing.frame_seconds(10)));
+
+        // A video that cannot decode never holds a clock.
+        state.active.get_mut(&VIDEO).expect("registered").broken = true;
+        assert!(state.shows_frame_at(VIDEO, 0.0));
+        assert!(state.shows_frame_at(VIDEO + 1, 0.0));
     }
 
     #[test]

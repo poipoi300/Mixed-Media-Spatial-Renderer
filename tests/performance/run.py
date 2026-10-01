@@ -144,7 +144,8 @@ class CatalogFixture:
         y = (image_id // side) % side
         z = image_id // (side * side)
         center = (side - 1) / 2
-        position = [(x - center) * 6.0, (y - center) * 6.0, (z - center) * 6.0]
+        # Cube units: one cube per image, neighbours touching.
+        position = [x - center, y - center, z - center]
         media_type = self.scenario.media_pattern[image_id % len(self.scenario.media_pattern)]
         if media_type == "video":
             path = self.video_path
@@ -156,12 +157,10 @@ class CatalogFixture:
             "image_id": image_id,
             "path": str(path.resolve()),
             "position": position,
-            "canonical_position": position,
             "width": side,
             "height": side,
             "media_type": media_type,
             "duration_seconds": 3.0 if media_type == "video" else None,
-            "footprint": [1.0, 1.0],
             "coordinate_labels": [str(x), str(y), str(z)],
         }
 
@@ -169,9 +168,6 @@ class CatalogFixture:
         axes = axes or [0, 1, 2]
         return {
             "axis_labels": [self.AXIS_LABELS[axis] for axis in axes],
-            "coordinate_spacing": 6.0,
-            "duplicate_spacing": 0.8,
-            "sprite_world_height": 3.9,
             "offset": 0,
             "limit": self.scenario.point_count,
             "total": count,

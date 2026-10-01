@@ -3,9 +3,9 @@
 //! and a speaker button with a volume popup — is shown. The strip itself
 //! (drawing, placement, where a press landed) lives in `video_strip`.
 //!
-//! A video's strip is shown while any of these hold:
+//! A video's strip is shown while any of these hold, whether or not the
+//! video has been started, and whether it plays or is paused:
 //! - the video is selected;
-//! - it has been started (owns a clock) and is paused;
 //! - one of its sliders is being dragged;
 //! - the pointer moved over the video within the last
 //!   `VIDEO_CONTROLS_AUTO_HIDE_SECONDS` (hovering the strip itself keeps it
@@ -21,7 +21,11 @@
 //! A playing clock runs on wall-clock time and follows its video's sound: it
 //! waits while the sound starts, then eases toward where the sound has got
 //! to, so picture and sound stay together through frame hitches and output
-//! clock drift. A video without sound runs on wall-clock time alone.
+//! clock drift. A video without sound runs on wall-clock time alone. Every
+//! start — the first play, a resume, a seek, a loop wrap — also waits for
+//! the picture to show the clock's frame, and the sound is held back until
+//! then, so both begin together however long the picture's decode takes to
+//! land.
 //!
 //! How a file plays — volume, mute, tracks, delays, speed, looping — lives
 //! in [`MediaSettings`], keyed by file, and is read here every frame. The
@@ -41,21 +45,22 @@ use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::window::{CursorMoved, PrimaryWindow};
 use spatial_viewer_ui::{
-    AudioSettings, ControlPanelState, PauseMenuState, PlaybackSettings, RenderResolutionSettings,
-    UiInputCapture,
+    Action, AudioSettings, ControlInput, PauseMenuState, PlaybackSettings,
+    RenderResolutionSettings, UiInputCapture,
 };
 
 use crate::audio_stream::{
     AudioClock, AudioClockSample, AudioPlaybackState, SoundChoice, SoundTrack,
 };
 use crate::axis_gizmo::cursor_over_axis_gizmo;
+use crate::folders::BillboardHover;
 use crate::image_loading::{MediaBillboard, BILLBOARD_VIDEO_TEXTURE_SIDE};
 use crate::manual_spacing::{cursor_world_ray, nearest_billboard_hit, SelectionState};
 use crate::media_probe::{MediaProbe, MediaProbes};
 use crate::media_settings::{MediaSettings, VideoFileSettings};
 use crate::video_stream::{PlaybackPosition, VideoPlaybackState};
 use crate::video_strip::{nearest_strip_hit, VideoStripHitQuery};
-use crate::{ExplorerScene, FlyCamera};
+use crate::{ExplorerScene, FlyCamera, RightDragCursorState};
 
 /// How long a strip stays revealed after the pointer last moved over its
 /// video. Only pointer motion reveals, so flying past videos with a still
@@ -92,6 +97,10 @@ const VIDEO_VOLUME_POPUP_LINGER_SECONDS: f32 = 0.35;
 const VIDEO_AUDIO_FOLLOW_SECONDS: f32 = 0.3;
 /// A gap to the sound larger than this is closed at once instead of eased.
 const VIDEO_AUDIO_RESYNC_SECONDS: f32 = 0.25;
+/// Longest a starting clock waits for its picture. Past it the clock and its
+/// sound start regardless, so a decode that never lands (a stalled ffmpeg)
+/// leaves the picture behind instead of silencing the whole video.
+const VIDEO_PICTURE_WAIT_MAX_SECONDS: f32 = 2.0;
 
 /// One video's playback clock. Lives in `VideoControlsState` from the first
 /// play or seek until the video's billboard unloads.
@@ -112,6 +121,12 @@ pub(crate) struct VideoPlaybackClock {
     /// Bumped on every discontinuous time change — a seek, a scrub step or a
     /// loop wrap — so the sound restarts at the new time.
     seek_generation: u64,
+    /// Seconds of playback the clock has waited for its picture since it
+    /// last started — creation, a resume, a seek, a loop wrap — until the
+    /// picture shows the clock's frame or the wait gives up (see
+    /// `VIDEO_PICTURE_WAIT_MAX_SECONDS`). The clock holds still meanwhile,
+    /// and its sound is held with it (see [`AudioClockSample::picture_ready`]).
+    picture_wait_seconds: Option<f32>,
 }
 
 impl VideoPlaybackClock {
@@ -128,6 +143,7 @@ impl VideoPlaybackClock {
             duration_known: duration_seconds.is_some(),
             playing: false,
             seek_generation: 0,
+            picture_wait_seconds: Some(0.0),
         }
     }
 
@@ -155,10 +171,20 @@ impl VideoPlaybackClock {
         self.duration_known.then_some(self.duration_seconds)
     }
 
+    fn awaiting_picture(&self) -> bool {
+        self.picture_wait_seconds.is_some()
+    }
+
+    /// Holds the clock, from its next step, until its picture is ready.
+    fn await_picture(&mut self) {
+        self.picture_wait_seconds = Some(0.0);
+    }
+
     fn seek_to(&mut self, time_seconds: f32) {
         let end = self.end_seconds().unwrap_or(f32::INFINITY);
         self.time_seconds = time_seconds.clamp(0.0, end);
         self.seek_generation += 1;
+        self.await_picture();
     }
 
     fn at_end(&self) -> bool {
@@ -179,6 +205,7 @@ impl VideoPlaybackClock {
         if looping {
             self.time_seconds %= end.max(0.001);
             self.seek_generation += 1;
+            self.await_picture();
         } else {
             self.time_seconds = end;
             self.playing = false;
@@ -186,8 +213,23 @@ impl VideoPlaybackClock {
     }
 
     /// Advances a playing clock by `delta_seconds` of wall-clock time, at
-    /// the file's speed, as its sound directs.
-    fn follow(&mut self, delta_seconds: f32, settings: &VideoFileSettings, audio: AudioClock) {
+    /// the file's speed, as its sound directs, once its picture shows the
+    /// frame it started at or the wait for it gives up.
+    fn follow(
+        &mut self,
+        delta_seconds: f32,
+        settings: &VideoFileSettings,
+        audio: AudioClock,
+        picture_ready: bool,
+    ) {
+        if let Some(waited_seconds) = self.picture_wait_seconds {
+            let waited_seconds = waited_seconds + delta_seconds;
+            if !picture_ready && waited_seconds < VIDEO_PICTURE_WAIT_MAX_SECONDS {
+                self.picture_wait_seconds = Some(waited_seconds);
+                return;
+            }
+            self.picture_wait_seconds = None;
+        }
         let video_delta = delta_seconds * settings.speed;
         match audio {
             AudioClock::Prerolling => {}
@@ -354,7 +396,6 @@ impl VideoControlsState {
                 .drag
                 .as_ref()
                 .is_some_and(|drag| drag.image_id == image_id)
-            || self.clock(image_id).is_some_and(|clock| !clock.playing)
     }
 
     /// Reveals the video's strip for another `VIDEO_CONTROLS_AUTO_HIDE_SECONDS`.
@@ -363,11 +404,14 @@ impl VideoControlsState {
             .insert(image_id, VIDEO_CONTROLS_AUTO_HIDE_SECONDS);
     }
 
-    /// What the video's strip shows, given how its file plays.
+    /// What the video's strip shows, given how its file plays. A video not
+    /// started yet shows where it will open (see
+    /// [`VideoFileSettings::opening_seconds`]).
     pub(crate) fn strip_status(
         &self,
         image_id: usize,
         unstarted_duration_seconds: f32,
+        remember_position: bool,
         settings: &VideoFileSettings,
     ) -> VideoStripStatus {
         let muted = settings.silent();
@@ -377,11 +421,14 @@ impl VideoControlsState {
                 clock.playing,
                 format_video_time_label(clock.time_seconds, clock.duration_seconds),
             ),
-            None => (
-                0.0,
-                false,
-                format_video_time_label(0.0, unstarted_duration_seconds),
-            ),
+            None => {
+                let opening_seconds = settings.opening_seconds(remember_position);
+                (
+                    (opening_seconds / unstarted_duration_seconds).clamp(0.0, 1.0),
+                    false,
+                    format_video_time_label(opening_seconds, unstarted_duration_seconds),
+                )
+            }
         };
         VideoStripStatus {
             normalized_time,
@@ -402,8 +449,11 @@ impl VideoControlsState {
     /// Playing a video that stopped at its end starts it over.
     pub(crate) fn set_playing(&mut self, image_id: usize, playing: bool) {
         if let Some(clock) = self.clocks.get_mut(&image_id) {
-            if playing && !clock.playing && clock.at_end() {
-                clock.seek_to(0.0);
+            if playing && !clock.playing {
+                if clock.at_end() {
+                    clock.seek_to(0.0);
+                }
+                clock.await_picture();
             }
             clock.playing = playing;
         }
@@ -501,18 +551,26 @@ impl VideoControlsState {
 
     /// Moves every playing clock `delta_seconds` of wall-clock time forward,
     /// at its file's speed, as the sound `audio_clock` reports for it
-    /// directs.
+    /// directs, once `shows_frame_at` says its video shows the frame for the
+    /// clock's time.
     fn advance_clocks(
         &mut self,
         delta_seconds: f32,
         settings: &MediaSettings,
         audio_clock: impl Fn(usize, u64) -> AudioClock,
+        shows_frame_at: impl Fn(usize, f32) -> bool,
     ) {
         let scrubbing = self.scrubbing_video();
         for (&image_id, clock) in &mut self.clocks {
             if clock.playing && scrubbing != Some(image_id) {
                 let audio = audio_clock(image_id, clock.seek_generation);
-                clock.follow(delta_seconds, &settings.video(&clock.path), audio);
+                let picture_ready = shows_frame_at(image_id, clock.time_seconds);
+                clock.follow(
+                    delta_seconds,
+                    &settings.video(&clock.path),
+                    audio,
+                    picture_ready,
+                );
             }
         }
     }
@@ -689,13 +747,36 @@ pub(crate) fn start_video(start: VideoStart, billboard: &MediaBillboard, max_tex
         audio_playback.activate(image_id, &*billboard.path);
     }
     let start_seconds = start
-        .remember_position
-        .then(|| start.media_settings.video(&billboard.path).resume_seconds)
-        .flatten()
-        .unwrap_or(0.0);
+        .media_settings
+        .video(&billboard.path)
+        .opening_seconds(start.remember_position);
     start
         .controls
         .start_clock(image_id, &billboard.path, duration_seconds, start_seconds);
+}
+
+/// What a video billboard's still frame — the one it shows while it has no
+/// playing frame — is decoded at.
+#[derive(SystemParam)]
+pub(crate) struct VideoStillTimes<'w> {
+    controls: Res<'w, VideoControlsState>,
+    media_settings: Res<'w, MediaSettings>,
+    playback_settings: Res<'w, PlaybackSettings>,
+}
+
+impl VideoStillTimes<'_> {
+    /// Where the video's clock stands, else where it will open, so the
+    /// still shows the frame playback continues from.
+    pub(crate) fn still_seconds(&self, image_id: usize, path: &str) -> f32 {
+        self.controls.clock(image_id).map_or_else(
+            || {
+                self.media_settings
+                    .video(path)
+                    .opening_seconds(self.playback_settings.remember_position)
+            },
+            VideoPlaybackClock::time_seconds,
+        )
+    }
 }
 
 /// Playback length of a video billboard; an unknown duration plays as one
@@ -763,25 +844,26 @@ pub(crate) fn clear_stale_video_controls(
 /// Ends a slider drag once the left button is released (or the pause menu
 /// opens), before the strip reads this frame's pointer.
 pub(crate) fn release_slider_drag(
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    input: ControlInput,
     pause_menu: Res<PauseMenuState>,
     mut controls_state: ResMut<VideoControlsState>,
 ) {
     if controls_state.dragged_slider().is_some()
-        && (pause_menu.paused || !mouse_buttons.pressed(MouseButton::Left))
+        && (pause_menu.paused || !input.pressed(Action::Select))
     {
         controls_state.end_slider_drag();
     }
 }
 
-/// Counts down hover reveals and reveals the video under a moving pointer.
-/// Only the nearest billboard under the pointer counts, so an image in front
-/// of a video shields it, and a strip in front of a video shields it too:
-/// hovering a strip is handled by the strip.
+/// Counts down hover reveals and reveals the video under a moving pointer,
+/// or under the look crosshair while the view is dragged. Only the nearest
+/// billboard under the pointer counts, so an image in front of a video
+/// shields it, and a strip in front of a video shields it too: hovering a
+/// strip is handled by the strip.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reveal_hovered_videos(
     time: Res<Time>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    right_drag: Res<RightDragCursorState>,
     mut cursor_moved: EventReader<CursorMoved>,
     pause_menu: Res<PauseMenuState>,
     ui_capture: Res<UiInputCapture>,
@@ -794,13 +876,10 @@ pub(crate) fn reveal_hovered_videos(
     strip_parts: VideoStripHitQuery,
 ) {
     controls_state.tick_reveals(time.delta_secs());
-    let pointer_moved = cursor_moved.read().count() > 0;
-    // A right-drag look moves the view, not the pointer over the scene.
-    if !pointer_moved
-        || pause_menu.paused
-        || ui_capture.blocks_world_clicks()
-        || mouse_buttons.pressed(MouseButton::Right)
-    {
+    // A look drag sweeps the scene under the parked pointer, which moves it
+    // over the scene as much as moving the pointer does.
+    let pointer_moved = cursor_moved.read().count() > 0 || right_drag.look_dragging();
+    if !pointer_moved || pause_menu.paused || ui_capture.blocks_world_clicks() {
         return;
     }
     let Ok(window) = window_query.get_single() else {
@@ -837,30 +916,36 @@ pub(crate) fn reveal_hovered_videos(
     }
 }
 
-/// YouTube-style keys for the selected videos: K plays/pauses them (pausing
-/// all when any is playing), J and L seek back and forward. Space is taken
-/// by flying up.
+/// YouTube-style keys for the video under the pointer, or else the selected
+/// videos: K plays/pauses them (pausing all when any is playing), J and L
+/// seek back and forward. Space is taken by flying up.
 pub(crate) fn handle_video_keyboard(
-    keyboard: Res<ButtonInput<KeyCode>>,
+    input: ControlInput,
     pause_menu: Res<PauseMenuState>,
-    control_panel: Res<ControlPanelState>,
     selection: Res<SelectionState>,
+    hover: Res<BillboardHover>,
     billboards: Query<&MediaBillboard>,
     mut playback: VideoPlaybackControl,
 ) {
-    if pause_menu.paused || control_panel.input_focused() {
+    if pause_menu.paused {
         return;
     }
-    let toggle = keyboard.just_pressed(KeyCode::KeyK);
-    let seek_steps = i32::from(keyboard.just_pressed(KeyCode::KeyL))
-        - i32::from(keyboard.just_pressed(KeyCode::KeyJ));
+    let toggle = input.just_pressed(Action::PlayPause);
+    let seek_steps = i32::from(input.just_pressed(Action::SeekForward))
+        - i32::from(input.just_pressed(Action::SeekBack));
     if !toggle && seek_steps == 0 {
         return;
     }
-    let selected_videos: Vec<&MediaBillboard> = billboards
+    let hovered_video = billboards
         .iter()
-        .filter(|billboard| billboard.is_video && selection.is_selected(billboard.image_id))
-        .collect();
+        .find(|billboard| billboard.is_video && hover.image_id() == Some(billboard.image_id));
+    let selected_videos: Vec<&MediaBillboard> = match hovered_video {
+        Some(hovered) => vec![hovered],
+        None => billboards
+            .iter()
+            .filter(|billboard| billboard.is_video && selection.is_selected(billboard.image_id))
+            .collect(),
+    };
     if toggle {
         let any_playing = selected_videos.iter().any(|billboard| {
             playback
@@ -890,6 +975,7 @@ pub(crate) fn advance_video_clocks(
     real_time: Res<Time<Real>>,
     pause_menu: Res<PauseMenuState>,
     audio_playback: Res<AudioPlaybackState>,
+    video_playback: Res<VideoPlaybackState>,
     probes: Res<MediaProbes>,
     media_settings: Res<MediaSettings>,
     mut controls_state: ResMut<VideoControlsState>,
@@ -900,6 +986,7 @@ pub(crate) fn advance_video_clocks(
             real_time.delta_secs(),
             &media_settings,
             |image_id, seek_generation| audio_playback.clock(image_id, seek_generation),
+            |image_id, time_seconds| video_playback.shows_frame_at(image_id, time_seconds),
         );
     }
 }
@@ -925,6 +1012,7 @@ pub(crate) fn sync_video_audio(
             time_seconds: clock.time_seconds,
             playing: controls.clock_advancing(image_id) && !pause_menu.paused,
             seek_generation: clock.seek_generation,
+            picture_ready: !clock.awaiting_picture(),
             gain: settings.output_gain(),
             sound: sound_choice(probes.get(Path::new(&*clock.path)), &settings),
         }
@@ -1125,7 +1213,7 @@ mod tests {
     }
 
     fn free_run(state: &mut VideoControlsState, settings: &MediaSettings, seconds: f32) {
-        state.advance_clocks(seconds, settings, |_, _| AudioClock::Free);
+        state.advance_clocks(seconds, settings, |_, _| AudioClock::Free, |_, _| true);
     }
 
     fn time(state: &VideoControlsState) -> f32 {
@@ -1246,40 +1334,85 @@ mod tests {
     fn a_playing_clock_waits_for_its_sound_then_eases_toward_it() {
         let settings = MediaSettings::in_memory();
         let mut state = state_with_playing_video();
-        state.advance_clocks(1.0, &settings, |_, _| AudioClock::Prerolling);
+        let shown = |_, _| true;
+        state.advance_clocks(1.0, &settings, |_, _| AudioClock::Prerolling, shown);
         assert_eq!(time(&state), 0.0);
 
         // A small gap closes over the follow period, not in one frame.
         let frame = 0.016;
-        state.advance_clocks(frame, &settings, |_, _| AudioClock::Playing(0.1));
+        state.advance_clocks(frame, &settings, |_, _| AudioClock::Playing(0.1), shown);
         let eased = time(&state);
         assert!(eased > frame && eased < 0.1);
 
         // A gap past the resync limit closes at once, without a seek.
-        state.advance_clocks(frame, &settings, |_, _| AudioClock::Playing(4.0));
+        state.advance_clocks(frame, &settings, |_, _| AudioClock::Playing(4.0), shown);
         let clock = state.clock(VIDEO).expect("started");
         assert!((clock.time_seconds - 4.0).abs() < 1e-4);
         assert_eq!(clock.seek_generation, 0);
     }
 
     #[test]
-    fn strips_show_for_selected_paused_scrubbed_or_recently_hovered_videos() {
+    fn every_start_waits_for_the_picture_but_a_running_clock_does_not() {
+        let settings = MediaSettings::in_memory();
+        let mut state = state_with_playing_video();
+        let step = 0.5;
+        let run = |state: &mut VideoControlsState, shown: bool| {
+            state.advance_clocks(step, &settings, |_, _| AudioClock::Free, |_, _| shown);
+        };
+        let picture_ready =
+            |state: &VideoControlsState| !state.clock(VIDEO).expect("started").awaiting_picture();
+        run(&mut state, false);
+        assert_eq!(time(&state), 0.0);
+        assert!(!picture_ready(&state));
+        run(&mut state, true);
+        assert_eq!(time(&state), 0.5);
+        assert!(picture_ready(&state));
+
+        // A frame landing late mid-playback does not hold the clock.
+        run(&mut state, false);
+        assert_eq!(time(&state), 1.0);
+
+        // A seek waits again, and so does a resume.
+        state.seek_by(VIDEO, 1.0);
+        run(&mut state, false);
+        assert_eq!(time(&state), 2.0);
+        run(&mut state, true);
+        state.set_playing(VIDEO, false);
+        state.set_playing(VIDEO, true);
+        assert!(!picture_ready(&state));
+        run(&mut state, true);
+        assert_eq!(time(&state), 3.0);
+
+        // A picture that never lands holds the clock only so long.
+        state.seek_by(VIDEO, 1.0);
+        let steps_within_limit = (VIDEO_PICTURE_WAIT_MAX_SECONDS / step) as usize - 1;
+        for _ in 0..steps_within_limit {
+            run(&mut state, false);
+        }
+        assert_eq!(time(&state), 4.0);
+        run(&mut state, false);
+        assert!(picture_ready(&state));
+        assert_eq!(time(&state), 4.5);
+    }
+
+    #[test]
+    fn strips_show_for_selected_scrubbed_or_recently_hovered_videos() {
         let mut state = VideoControlsState::default();
-        // An untouched poster only shows when selected.
+        // An untouched poster shows when selected or hovered.
         assert!(!state.strip_shown(VIDEO, false));
         assert!(state.strip_shown(VIDEO, true));
 
-        // A started, paused video always shows.
+        // Started, playing or paused, it follows the same rules.
         state.start_clock(VIDEO, &path(), Some(10.0), 0.0);
-        assert!(state.strip_shown(VIDEO, false));
-
-        // A playing video shows while revealed or scrubbed.
-        state.set_playing(VIDEO, true);
-        assert!(!state.strip_shown(VIDEO, false));
-        state.reveal(VIDEO);
-        assert!(state.strip_shown(VIDEO, false));
-        state.tick_reveals(VIDEO_CONTROLS_AUTO_HIDE_SECONDS);
-        assert!(!state.strip_shown(VIDEO, false));
+        for playing in [false, true] {
+            state.set_playing(VIDEO, playing);
+            assert!(!state.strip_shown(VIDEO, false));
+            assert!(state.strip_shown(VIDEO, true));
+            state.reveal(VIDEO);
+            assert!(state.strip_shown(VIDEO, false));
+            state.tick_reveals(VIDEO_CONTROLS_AUTO_HIDE_SECONDS);
+            assert!(!state.strip_shown(VIDEO, false));
+        }
         state.begin_scrub(VIDEO, ScrubGrab::Knob(0.0));
         assert!(state.strip_shown(VIDEO, false));
     }
@@ -1302,7 +1435,7 @@ mod tests {
         state.forget(VIDEO);
         let renumbered = VIDEO + 1;
         state.start_clock(renumbered, &path(), Some(10.0), 0.0);
-        let status = state.strip_status(renumbered, 10.0, &settings.video(PATH));
+        let status = state.strip_status(renumbered, 10.0, true, &settings.video(PATH));
         assert_eq!(status.volume, 0.8);
     }
 
@@ -1312,7 +1445,7 @@ mod tests {
         let mut video = VideoFileSettings::default();
         video.set_volume(0.6);
         video.toggle_mute();
-        let status = state.strip_status(VIDEO, 10.0, &video);
+        let status = state.strip_status(VIDEO, 10.0, true, &video);
         assert!(status.muted);
         assert_eq!(status.volume, 0.0);
     }
@@ -1322,7 +1455,7 @@ mod tests {
         let mut settings = MediaSettings::in_memory();
         let mut state = state_with_playing_video();
         state.hover_volume(VIDEO);
-        let status = state.strip_status(VIDEO, 10.0, &VideoFileSettings::default());
+        let status = state.strip_status(VIDEO, 10.0, true, &VideoFileSettings::default());
         assert!(status.volume_popup_open);
         state.tick_reveals(VIDEO_VOLUME_POPUP_LINGER_SECONDS * 0.5);
         assert!(state.volume_popup_open(VIDEO));
@@ -1368,6 +1501,23 @@ mod tests {
         let mut reopened = VideoControlsState::default();
         reopened.start_clock(VIDEO, &path(), Some(10.0), 4.5);
         assert_eq!(time(&reopened), 4.5);
+    }
+
+    #[test]
+    fn an_unstarted_strip_shows_where_the_video_will_open() {
+        let state = VideoControlsState::default();
+        let video = VideoFileSettings {
+            resume_seconds: Some(4.0),
+            ..VideoFileSettings::default()
+        };
+        let status = state.strip_status(VIDEO, 10.0, true, &video);
+        assert_eq!(status.normalized_time, 0.4);
+        assert_eq!(status.time_label, "0:04 / 0:10");
+        assert!(!status.playing);
+
+        let forgetting = state.strip_status(VIDEO, 10.0, false, &video);
+        assert_eq!(forgetting.normalized_time, 0.0);
+        assert_eq!(forgetting.time_label, "0:00 / 0:10");
     }
 
     #[test]
