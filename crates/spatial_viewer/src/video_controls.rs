@@ -60,6 +60,7 @@ use crate::media_probe::{MediaProbe, MediaProbes};
 use crate::media_settings::{MediaSettings, VideoFileSettings};
 use crate::video_stream::{PlaybackPosition, VideoPlaybackState};
 use crate::video_strip::{nearest_strip_hit, VideoStripHitQuery};
+use crate::video_texture::{VideoFrameTexture, VideoFrameUploads};
 use crate::{ExplorerScene, FlyCamera, RightDragCursorState};
 
 /// How long a strip stays revealed after the pointer last moved over its
@@ -1081,25 +1082,27 @@ pub(crate) fn remember_positions_on_exit(
     }
 }
 
-/// Billboard textures are `RENDER_WORLD`-only, so the main-world copy is
-/// gone once extracted and cannot be modified in place; re-inserting under
-/// the same handle re-uploads the image but the material's bind group keeps
-/// pointing at the previous GPU texture. Each frame therefore gets a fresh
-/// handle and the material is re-pointed at it, which rebuilds the bind
-/// group; dropping the previous handle frees its texture.
+/// Writes each playing video's frame for its clock into its billboard's
+/// [`VideoFrameTexture`] (see [`crate::video_texture`]). The material is
+/// pointed at a new texture, along with the first frame written into it,
+/// only when the billboard's surface does not draw one of the frame's size;
+/// later frames overwrite it in place.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_video_playback_frame(
+    mut commands: Commands,
     controls: Res<VideoControlsState>,
     probes: Res<MediaProbes>,
     media_settings: Res<MediaSettings>,
     mut video_playback: ResMut<VideoPlaybackState>,
-    mut billboard_query: Query<&mut MediaBillboard>,
+    mut billboard_query: Query<(Entity, &mut MediaBillboard, Option<&VideoFrameTexture>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
+    images: Res<Assets<Image>>,
+    mut frame_uploads: ResMut<VideoFrameUploads>,
 ) {
     if controls.clocks.is_empty() {
         return;
     }
-    for mut billboard in &mut billboard_query {
+    for (entity, mut billboard, frame_texture) in &mut billboard_query {
         let image_id = billboard.image_id;
         let Some(clock) = controls.clocks.get(&image_id) else {
             continue;
@@ -1110,7 +1113,7 @@ pub(crate) fn apply_video_playback_frame(
         let subtitles = probe
             .info()
             .and_then(|info| media_settings.video(&clock.path).subtitle_burn(info));
-        let Some(image) = video_playback.take_frame_for_time(
+        let Some(frame) = video_playback.take_frame_for_time(
             image_id,
             PlaybackPosition {
                 time_seconds: clock.time_seconds,
@@ -1122,16 +1125,27 @@ pub(crate) fn apply_video_playback_frame(
             continue;
         };
         let assets = &mut billboard.surface_assets;
-        if let (Some(texture_handle), Some(material_handle)) = (
-            assets.texture_handle.as_mut(),
-            assets.material_handle.as_ref(),
-        ) {
-            if let Some(material) = materials.get_mut(material_handle) {
-                let frame_handle = images.add(image);
-                material.base_color_texture = Some(frame_handle.clone());
-                *texture_handle = frame_handle;
+        let drawn_texture = assets.texture_handle.as_ref().filter(|surface_texture| {
+            frame_texture.is_some_and(|texture| texture.is(surface_texture, frame.side))
+        });
+        let texture = match drawn_texture {
+            Some(texture) => texture.clone(),
+            None => {
+                let Some(material) = assets
+                    .material_handle
+                    .as_ref()
+                    .and_then(|material_handle| materials.get_mut(material_handle))
+                else {
+                    continue;
+                };
+                let (frame_texture, texture) = VideoFrameTexture::reserve(&images, frame.side);
+                material.base_color_texture = Some(texture.clone());
+                assets.texture_handle = Some(texture.clone());
+                commands.entity(entity).insert(frame_texture);
+                texture
             }
-        }
+        };
+        frame_uploads.queue(&texture, frame);
     }
 }
 

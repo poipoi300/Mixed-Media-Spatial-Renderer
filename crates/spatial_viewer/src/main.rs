@@ -78,6 +78,7 @@ mod video_controls;
 mod video_stream;
 mod video_strip;
 mod video_strip_layout;
+mod video_texture;
 
 use arrangement_history::{apply_edit_requests, ArrangementHistory};
 use arrangement_store::{
@@ -518,6 +519,7 @@ fn main() -> Result<()> {
                 }),
         )
         .add_plugins(FolderWallPlugin)
+        .add_plugins(video_texture::VideoTexturePlugin)
         .add_plugins(performance::PerformanceHarnessPlugin)
         // Feeds the in-app catalog benchmark's hardware section. Sampling is
         // throttled internally and runs off the main thread.
@@ -1201,24 +1203,21 @@ fn disable_camera_msaa(mut cameras: Query<&mut Msaa, With<Camera>>) {
     }
 }
 
-/// The per-frame GPU upload budget bounds image tile uploads; playing videos
-/// add one frame's worth of bytes each on top so their frames are never
-/// deferred behind a tile. Bevy drops the previous GPU texture the moment a
-/// replacement is extracted, so a deferred video frame renders as a blank
-/// billboard for a frame (visible flicker).
+/// The per-frame GPU upload budget bounds image tile uploads. Video frames
+/// bypass it: they are written into their texture in place (see
+/// [`video_texture`]).
 fn enable_gpu_upload_budget_after_startup(
     mut startup_frames: Local<u8>,
-    video_playback: Res<VideoPlaybackState>,
     mut upload_budget: ResMut<RenderAssetBytesPerFrame>,
 ) {
-    if upload_budget.max_bytes.is_none() && *startup_frames < 3 {
+    if upload_budget.max_bytes.is_some() {
+        return;
+    }
+    if *startup_frames < 3 {
         *startup_frames += 1;
         return;
     }
-    let max_bytes = BILLBOARD_GPU_UPLOAD_BYTES_PER_FRAME + video_playback.frame_upload_bytes();
-    if upload_budget.max_bytes != Some(max_bytes) {
-        *upload_budget = RenderAssetBytesPerFrame::new(max_bytes);
-    }
+    *upload_budget = RenderAssetBytesPerFrame::new(BILLBOARD_GPU_UPLOAD_BYTES_PER_FRAME);
 }
 
 fn create_scene_render_target_image(size: UVec2) -> Image {
@@ -2047,7 +2046,6 @@ mod tests {
     fn gpu_upload_budget_activates_after_static_startup_assets() {
         let mut app = App::new();
         app.init_resource::<RenderAssetBytesPerFrame>()
-            .init_resource::<VideoPlaybackState>()
             .add_systems(Update, enable_gpu_upload_budget_after_startup);
 
         for _ in 0..3 {

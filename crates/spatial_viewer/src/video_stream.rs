@@ -5,8 +5,8 @@ use crossbeam_channel::{Receiver, TryRecvError};
 
 use crate::ffmpeg_pipe::{spawn_ffmpeg_stream, StreamEnd, StreamItem};
 use crate::media_decode::{
-    decoded_image_to_bevy_image, video_decode_side, video_stream_arguments, DecodedImage,
-    SubtitleBurn, VideoSource, VideoTiming, DEFAULT_MAX_VIDEO_FPS,
+    video_decode_side, video_stream_arguments, DecodedImage, SubtitleBurn, VideoSource,
+    VideoTiming, DEFAULT_MAX_VIDEO_FPS,
 };
 use crate::media_probe::MediaProbe;
 
@@ -236,20 +236,6 @@ impl VideoPlaybackState {
             .count()
     }
 
-    /// Bytes one decoded frame of every streaming video occupies on the GPU;
-    /// video frames are uploaded on top of the image tile budget so a frame
-    /// that lands in the same frame as a tile upload is never skipped.
-    pub fn frame_upload_bytes(&self) -> usize {
-        self.active
-            .values()
-            .filter(|active| active.stream.is_some())
-            .map(|active| {
-                let side = video_decode_side(active.max_texture_side) as usize;
-                side * side * 4
-            })
-            .sum()
-    }
-
     /// The frame to show next for a video's clock, when it changes. Starts,
     /// restarts or stops the video's stream as the clock and the chosen
     /// `subtitles` require. `probe` is the video file's.
@@ -259,7 +245,7 @@ impl VideoPlaybackState {
         position: PlaybackPosition,
         probe: &MediaProbe,
         subtitles: Option<SubtitleBurn>,
-    ) -> Option<Image> {
+    ) -> Option<DecodedImage> {
         let max_fps = self.max_fps;
         let active = self.active.get_mut(&image_id)?;
         let timing = active.resolve_timing(probe, max_fps)?;
@@ -389,7 +375,7 @@ impl ActiveVideoPlayback {
     /// Advances the stream to `target` and returns the frame to show, if it
     /// changed. A stream that lands just past the target (the clock eased
     /// back) still shows its first frame rather than nothing.
-    fn read_stream_to(&mut self, image_id: usize, target: u64) -> Option<Image> {
+    fn read_stream_to(&mut self, image_id: usize, target: u64) -> Option<DecodedImage> {
         let stream = self.stream.as_mut()?;
         let mut due = None;
         let ended = stream.read_to(target, &mut due);
@@ -405,7 +391,7 @@ impl ActiveVideoPlayback {
         }
         self.applied_frame_index = Some(frame_index);
         let side = video_decode_side(self.max_texture_side);
-        Some(decoded_image_to_bevy_image(DecodedImage::full(side, rgba)))
+        Some(DecodedImage::full(side, rgba))
     }
 
     /// Records what a finished stream says about the file: where its frames
@@ -507,7 +493,7 @@ mod tests {
     }
 
     /// The frame lookup for a video whose timing is already settled.
-    fn take(state: &mut VideoPlaybackState, position: PlaybackPosition) -> Option<Image> {
+    fn take(state: &mut VideoPlaybackState, position: PlaybackPosition) -> Option<DecodedImage> {
         state.take_frame_for_time(VIDEO, position, &MediaProbe::Pending, None)
     }
 

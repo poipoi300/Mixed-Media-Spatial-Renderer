@@ -518,20 +518,6 @@ fn decode_rgba_video_frames(
     Ok(frames)
 }
 
-pub fn decoded_image_to_bevy_image(decoded: DecodedImage) -> Image {
-    Image::new(
-        Extent3d {
-            width: decoded.side,
-            height: decoded.side,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        decoded.rgba,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD,
-    )
-}
-
 pub fn billboard_surface_to_bevy_image(surface: BillboardSurface) -> Image {
     billboard_surface_image(
         surface.width,
