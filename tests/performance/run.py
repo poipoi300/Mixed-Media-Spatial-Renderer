@@ -44,8 +44,11 @@ class Scenario:
     point_count: int
     media_pattern: tuple[str, ...]
     expected_video: bool
-    #: Harness timeline: ``interactive`` discrete actions, or ``patrol`` one
-    #: continuous camera sweep that keeps loading and evicting all run long.
+    #: Harness timeline: ``interactive`` discrete actions, ``patrol`` one
+    #: continuous camera sweep that keeps loading and evicting all run long,
+    #: ``parked`` a camera that never moves, so steady-state load/unload
+    #: is cache churn rather than navigation, or ``parked_inside`` a camera
+    #: parked at the catalog centre that turns around once without moving.
     timeline: str = "interactive"
     #: Image sizes cycled through the catalog; a single entry means every
     #: image point shares the one fixture image.
@@ -791,6 +794,26 @@ def main() -> int:
             ("image",),
             False,
             timeline="patrol",
+            image_sides=MIXED_IMAGE_SIDES,
+        ),
+        # The same catalog with the camera parked: once the budget is full
+        # nothing in view changes, so every eviction after the fill is churn.
+        Scenario(
+            "mixed-sizes-parked",
+            args.patrol_points,
+            ("image",),
+            False,
+            timeline="parked",
+            image_sides=MIXED_IMAGE_SIDES,
+        ),
+        # Parked at the centre facing one way, then turned in place: whether
+        # looking at billboards, without flying toward them, loads them.
+        Scenario(
+            "mixed-sizes-parked-inside",
+            args.patrol_points,
+            ("image",),
+            False,
+            timeline="parked_inside",
             image_sides=MIXED_IMAGE_SIDES,
         ),
     ]

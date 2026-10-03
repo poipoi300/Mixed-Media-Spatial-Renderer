@@ -239,6 +239,55 @@ pub struct BillboardStats {
     pub encode_mixed_texels: u64,
     pub encode_opaque_nanos: u64,
     pub encode_mixed_nanos: u64,
+    /// Cumulative over the run.
+    pub cache_churn: BillboardCacheChurn,
+}
+
+/// How much work the texture cache has spent displacing its own residents.
+///
+/// With the budget full, residents are evicted to admit better-placed
+/// images; that is the cache doing its job. Load/unload at a camera that is
+/// not moving is not, and shows up here as `reloads` climbing while nothing
+/// in the view changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BillboardCacheChurn {
+    /// Residents evicted to make room for an arriving image.
+    pub evicted_for_arrivals: usize,
+    /// Residents evicted because the cache, counting decodes still in
+    /// flight, was over its budget.
+    pub evicted_over_budget: usize,
+    /// Successfully decoded images dropped on arrival for lack of room.
+    pub discarded_decodes: usize,
+    /// Billboards admitted for an image evicted earlier in the same catalog.
+    pub reloads: usize,
+    /// The part of `reloads` that took free room rather than displacing a
+    /// resident.
+    pub reloads_into_free_room: usize,
+}
+
+impl BillboardCacheChurn {
+    pub fn evictions(self) -> usize {
+        self.evicted_for_arrivals + self.evicted_over_budget
+    }
+
+    /// What accumulated after `earlier` was read, for a measurement window.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            evicted_for_arrivals: self
+                .evicted_for_arrivals
+                .saturating_sub(earlier.evicted_for_arrivals),
+            evicted_over_budget: self
+                .evicted_over_budget
+                .saturating_sub(earlier.evicted_over_budget),
+            discarded_decodes: self
+                .discarded_decodes
+                .saturating_sub(earlier.discarded_decodes),
+            reloads: self.reloads.saturating_sub(earlier.reloads),
+            reloads_into_free_room: self
+                .reloads_into_free_room
+                .saturating_sub(earlier.reloads_into_free_room),
+        }
+    }
 }
 
 #[derive(Resource, Default)]

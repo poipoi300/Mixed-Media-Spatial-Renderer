@@ -24,14 +24,31 @@ The API streams catalog snapshots beginning with the first discovered media file
 the camera starts at that coordinate while later snapshots update the coordinate
 space in place without moving the player or previously placed billboards again.
 Which image is decoded next is chosen by a weighted random draw rather than by a
-queue. Every candidate — a point with no texture, and a resident whose texture no
-longer suits its distance — is scored by one Gaussian centred on the camera (or on
-where the camera is heading), narrowed by view direction, and the frame's free decode
-workers are filled from a single sample over all of them. There are no per-lane worker
-rations, so a free worker is filled whenever any work exists and nothing can be starved
-by a lane boundary: a distant image is not forbidden, just drawn with vanishing
-probability. Points outside the render boundary score exactly zero, since the boundary
-walls hide them at any quality.
+queue. Every point with no texture is scored by one utility: it falls with the fourth
+power of distance from the camera (or from where the camera is heading), and a point
+behind the camera counts as up to 8x farther than it is. The frame's free decode workers
+are filled from a single sample over all candidates. There are no per-lane worker
+rations, so a free worker is filled whenever any work exists. Points outside the render
+boundary score exactly zero, since the boundary walls hide them at any quality.
+
+Candidates are gathered by a best-first walk over a spatial grid, visiting cells in
+order of the most any point inside them could be worth, so the visited region stretches
+out along the view rather than forming a cube around the camera. The walk's per-frame
+budget ends a few widths out in a dense catalog, so the rest of the view is sampled
+instead: positions drawn in a cone ahead of the camera, log-uniform in distance, offer
+the points of the cells they land in, weighted by value over the chance that cell was
+probed. Across frames the draw then follows the utility all the way out — the number of
+draws at each distance falls monotonically, and a billboard you are looking at is
+reachable however far away it is.
+
+The same utility decides eviction (least valuable first) and admission: once the VRAM
+budget is full, a candidate is only drawn if it is worth more than the least valuable
+resident, and a decode to replace residents only starts if the candidate is worth at
+least 4x each one it displaces. That margin keeps a moving camera from trading
+near-equals back and forth, while a turn — where the image now in view is worth
+thousands of times the one behind — clears it easily. Any number of replacements may be
+in flight; each reserves the residents it will displace, which stay on screen until it
+lands.
 Every image is decoded once, at source resolution, and uploaded as one GPU texture.
 There is no LOD ladder. Distance-based tiers were measured against the alternative on a
 real catalog and lost on both counts: because reading and parsing the file is ~70% of a
@@ -91,9 +108,9 @@ cannot show it when a later stage binds. Measured on 25 s fills from an empty ca
 | decode busy | 0.925 | 0.832 | **0.657** |
 
 **5.0x less encode CPU** for 1.12x the images. What remains alpha-encoded is a source
-image that genuinely carries transparency. Steady-state numbers understate all of this:
-once the VRAM budget is full only one replacement decode may be in flight at a time, so
-most workers are idle by design and faster encoding cannot show up at all.
+image that genuinely carries transparency. These numbers were taken when only one
+replacement decode could be in flight once the VRAM budget was full, so steady-state
+workers were mostly idle and they understate what faster encoding buys.
 
 **Why one surface rather than a tile grid.** Tiles were a grid of separate meshes, each
 with its own model matrix. A rasterizer only guarantees watertight adjacency between

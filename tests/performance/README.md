@@ -1,6 +1,6 @@
 # Rendered performance emulation
 
-This suite launches four real viewer processes concurrently against isolated
+This suite launches six real viewer processes concurrently against isolated
 local streaming APIs:
 
 - one image;
@@ -10,6 +10,13 @@ local streaming APIs:
   with the camera sweeping the whole catalog for the entire run so loading,
   quality refresh, multi-tile upload and eviction never stop. This is the
   frame-time uniformity workload.
+- `mixed-sizes-parked`: the same catalog with the camera never moving. Once
+  the texture budget is full nothing in view changes, so the heartbeat's
+  `billboards.cache_churn` counters after the fill measure cache churn alone.
+- `mixed-sizes-parked-inside`: the same catalog with the camera parked at its
+  centre facing +X, then turned in place to face -X. The heartbeat's
+  `visible_billboards` / `visible_textured` show whether looking at
+  billboards, without flying toward them, is enough to load them.
 
 The default run lasts five minutes per process. The fixture sends the first
 point immediately, then geometrically larger full snapshots whose coordinates

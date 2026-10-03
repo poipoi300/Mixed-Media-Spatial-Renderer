@@ -42,8 +42,8 @@ use bevy::{
 };
 use serde_json::{json, Value};
 use spatial_viewer_ui::{
-    BenchmarkControls, BenchmarkPhase, BenchmarkReport, BenchmarkStageRow, BillboardControls,
-    BillboardStats, NavigationSettings,
+    BenchmarkControls, BenchmarkPhase, BenchmarkReport, BenchmarkStageRow, BillboardCacheChurn,
+    BillboardControls, BillboardStats, NavigationSettings,
 };
 
 use crate::{
@@ -304,6 +304,18 @@ struct PipelineAccumulator {
     encode_mixed_texels: u64,
     encode_opaque_nanos: u64,
     encode_mixed_nanos: u64,
+    /// The loader's cumulative churn counters at the first sampled frame and
+    /// at the latest one. Their difference is the run's churn; the counters
+    /// themselves also include the initial fill and earlier navigation.
+    cache_churn_at_start: Option<BillboardCacheChurn>,
+    cache_churn_latest: BillboardCacheChurn,
+}
+
+impl PipelineAccumulator {
+    fn cache_churn(&self) -> BillboardCacheChurn {
+        self.cache_churn_latest
+            .since(self.cache_churn_at_start.unwrap_or(self.cache_churn_latest))
+    }
 }
 
 #[derive(Default)]
@@ -473,6 +485,10 @@ fn sample_frame(
     pipeline.encode_mixed_texels = stats.encode_mixed_texels;
     pipeline.encode_opaque_nanos = stats.encode_opaque_nanos;
     pipeline.encode_mixed_nanos = stats.encode_mixed_nanos;
+    pipeline
+        .cache_churn_at_start
+        .get_or_insert(stats.cache_churn);
+    pipeline.cache_churn_latest = stats.cache_churn;
 
     record_worst_frame(
         &mut active.worst_frames,
@@ -591,9 +607,21 @@ fn finish_run(
             (pipeline.encode_opaque_nanos + pipeline.encode_mixed_nanos) as f64 / 1.0e9,
         )
     };
+    let cache_churn = pipeline.cache_churn();
+    let churn_line = if cache_churn.evictions() == 0 && cache_churn.discarded_decodes == 0 {
+        String::new()
+    } else {
+        format!(
+            "
+         cache: {} evictions, {} reloads, {} decodes discarded",
+            cache_churn.evictions(),
+            cache_churn.reloads,
+            cache_churn.discarded_decodes,
+        )
+    };
     let summary = format!(
         "{fps:.0} fps  p95 {p95:.1} ms  p99 {p99:.1} ms
-\n         {:.0}% of {mean_visible:.0} in-view points textured{encode_line}
+\n         {:.0}% of {mean_visible:.0} in-view points textured{encode_line}{churn_line}
 \n         {bottleneck}",
         visible_quality * 100.0
     );
@@ -659,6 +687,13 @@ fn finish_run(
             "mean_visible_billboards": pipeline.visible_billboard_samples as f64
                 / pipeline.decode_worker_frames.max(1) as f64,
             "orientation_updates": pipeline.orientation_updated,
+            "cache_churn": {
+                "evicted_for_arrivals": cache_churn.evicted_for_arrivals,
+                "evicted_over_budget": cache_churn.evicted_over_budget,
+                "discarded_decodes": cache_churn.discarded_decodes,
+                "reloads": cache_churn.reloads,
+                "reloads_into_free_room": cache_churn.reloads_into_free_room,
+            },
         },
         "surface_encoding": surface_encoding_json(pipeline),
         "worst_frames": active.worst_frames.iter().map(|frame| json!({

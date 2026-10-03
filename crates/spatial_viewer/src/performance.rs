@@ -75,6 +75,37 @@ enum TimelineKind {
     /// One continuous camera sweep through the whole catalog so billboards
     /// load, refresh quality, and evict for the entire run.
     Patrol,
+    /// No input at all: the camera stays where the catalog load placed it.
+    /// With the texture budget below the catalog's footprint, the cache fills
+    /// and should then hold still, so any steady load/unload is churn in the
+    /// cache's own admission decisions rather than a response to navigation.
+    Parked,
+    /// The camera is parked at the catalog centre facing +X, then turned in
+    /// place to face -X. Half the catalog is behind it at any time, so this
+    /// measures whether looking at billboards, without flying toward them,
+    /// is enough to load them.
+    ParkedInside,
+}
+
+/// Fractions of the run at which the parked-inside camera is placed facing
+/// +X, then turned to face -X.
+const PARKED_INSIDE_PLACE_AT: f64 = 0.25;
+const PARKED_INSIDE_TURN_AT: f64 = 0.6;
+
+/// Which way a parked camera faces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkFacing {
+    PositiveX,
+    NegativeX,
+}
+
+impl ParkFacing {
+    fn direction(self) -> Vec3 {
+        match self {
+            Self::PositiveX => Vec3::X,
+            Self::NegativeX => Vec3::NEG_X,
+        }
+    }
 }
 
 fn default_heartbeat_seconds() -> f64 {
@@ -407,6 +438,10 @@ enum ActionKind {
     Patrol {
         seconds: f64,
     },
+    /// Place the camera at rest at the catalog centre, facing `facing`.
+    ParkAtCentre {
+        facing: ParkFacing,
+    },
 }
 
 impl ActionKind {
@@ -434,6 +469,12 @@ impl ActionKind {
             Self::StartFirstVideo => "start_first_video",
             Self::ReprojectAxes => "reproject_axes",
             Self::Patrol { .. } => "patrol_catalog",
+            Self::ParkAtCentre {
+                facing: ParkFacing::PositiveX,
+            } => "park_facing_positive_x",
+            Self::ParkAtCentre {
+                facing: ParkFacing::NegativeX,
+            } => "park_facing_negative_x",
         }
     }
 }
@@ -494,6 +535,36 @@ fn build_timeline(config: &HarnessConfig) -> Vec<ScheduledAction> {
                     seconds: patrol_end - patrol_start,
                 },
             ),
+        ];
+        actions.sort_by(|left, right| left.scheduled_at.total_cmp(&right.scheduled_at));
+        return actions;
+    }
+    if config.timeline == TimelineKind::ParkedInside {
+        let mut actions = vec![
+            scheduled(at(1.0), ActionKind::CatalogFirstPoint),
+            scheduled(at(12.0), ActionKind::CatalogComplete),
+            scheduled(at(20.0), ActionKind::FirstTextureLoaded),
+            scheduled(
+                config.duration_seconds * PARKED_INSIDE_PLACE_AT,
+                ActionKind::ParkAtCentre {
+                    facing: ParkFacing::PositiveX,
+                },
+            ),
+            scheduled(
+                config.duration_seconds * PARKED_INSIDE_TURN_AT,
+                ActionKind::ParkAtCentre {
+                    facing: ParkFacing::NegativeX,
+                },
+            ),
+        ];
+        actions.sort_by(|left, right| left.scheduled_at.total_cmp(&right.scheduled_at));
+        return actions;
+    }
+    if config.timeline == TimelineKind::Parked {
+        let mut actions = vec![
+            scheduled(at(1.0), ActionKind::CatalogFirstPoint),
+            scheduled(at(12.0), ActionKind::CatalogComplete),
+            scheduled(at(20.0), ActionKind::FirstTextureLoaded),
         ];
         actions.sort_by(|left, right| left.scheduled_at.total_cmp(&right.scheduled_at));
         return actions;
@@ -819,6 +890,31 @@ fn drive_timeline(
                         ));
                     }
                 }
+                ActionKind::ParkAtCentre { facing } => {
+                    let Ok((mut transform, mut fly_camera)) = camera.get_single_mut() else {
+                        continue;
+                    };
+                    transform.translation = scene.bounds.center;
+                    transform.look_to(facing.direction(), Vec3::Y);
+                    let (yaw, pitch) = crate::yaw_pitch_from_rotation(transform.rotation);
+                    fly_camera.yaw = yaw;
+                    fly_camera.pitch = pitch;
+                    fly_camera.velocity = Vec3::ZERO;
+                    action.status = ActionStatus::Checking {
+                        deadline: elapsed + grace,
+                        baseline: None,
+                        baseline_clock: None,
+                    };
+                    events.push(action_event(
+                        action,
+                        elapsed,
+                        "started",
+                        json!({
+                            "position": scene.bounds.center.to_array(),
+                            "facing": facing.direction().to_array(),
+                        }),
+                    ));
+                }
                 ActionKind::Patrol { seconds } => {
                     let Ok((mut transform, mut fly_camera)) = camera.get_single_mut() else {
                         continue;
@@ -1117,6 +1213,13 @@ fn evaluate_action(
                 "axis_labels": scene.projection.axis_labels,
             }),
         ),
+        ActionKind::ParkAtCentre { .. } => compare_wait(
+            camera_position.is_some_and(|position| position.distance(scene.bounds.center) < 1e-3),
+            json!({
+                "expected_position": scene.bounds.center.to_array(),
+                "camera_position": camera_position.map(|position| position.to_array()),
+            }),
+        ),
         ActionKind::Patrol { .. } => {
             let expected_minimum = expected_points.min(PATROL_MIN_DISTINCT_LOADED);
             let actual = json!({
@@ -1274,6 +1377,17 @@ fn collect_telemetry(
                 "uploaded_textures": value.uploaded_textures,
                 "uploaded_bytes": value.uploaded_bytes,
                 "upload_queue": value.upload_queue,
+                "visible_billboards": value.visible_billboards,
+                "visible_textured": value.visible_textured,
+                "texture_bytes_used": value.texture_bytes_used,
+                "texture_budget_bytes": value.texture_budget_bytes,
+                "cache_churn": {
+                    "evicted_for_arrivals": value.cache_churn.evicted_for_arrivals,
+                    "evicted_over_budget": value.cache_churn.evicted_over_budget,
+                    "discarded_decodes": value.cache_churn.discarded_decodes,
+                    "reloads": value.cache_churn.reloads,
+                    "reloads_into_free_room": value.cache_churn.reloads_into_free_room,
+                },
             })),
             "video": {
                 "clocks": video_controls.as_ref().map_or(0, |value| value.clock_count()),

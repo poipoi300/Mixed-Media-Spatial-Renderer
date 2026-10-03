@@ -14,59 +14,108 @@
 //! exists, and the *mix* of work emerges from the scores rather than from a
 //! constant someone tuned.
 //!
-//! The score is a Gaussian in the distance from the camera, measured from
-//! whichever of the current and projected camera position is nearer (so an
-//! image being approached scores as though already close), multiplied by a
-//! view-direction factor. Its thin tails are the point: a billboard far
-//! outside the view is not forbidden, just drawn with vanishing probability,
-//! so no cap is needed to keep the workers pointed at what matters.
+//! The score is a utility: how much showing a billboard is worth, from its
+//! distance and from where it sits relative to the view direction, measured
+//! from whichever of the current and projected camera position is nearer (so
+//! an image being approached scores as though already close). It falls off
+//! as a power of distance rather than a Gaussian, so a billboard the camera
+//! is looking at keeps a real chance however far away it is, while one
+//! behind the camera counts as several times farther than it is.
 
 use bevy::prelude::*;
 
-/// Standard deviation of the selection Gaussian, in scene reference
-/// distances.
+/// Power the utility falls off with, in distance.
 ///
-/// Sized so the full-quality band (`BILLBOARD_FULL_RES_DISTANCE_FACTOR`, 5
-/// reference distances) sits at two sigma. A Gaussian only concentrates
-/// probability where its tail is genuinely thin: at one sigma per band the
-/// distribution is so flat that a handful of distant candidates outweigh the
-/// near ones by sheer count, which measured as a near-field share of ~60% —
-/// not a priority at all. At two sigma per band the same arrangement gives
-/// the near field ~95%, while everything further out keeps a small but real
-/// probability instead of being capped away.
-const LOAD_VALUE_SIGMA_STEPS: f32 = 2.5;
-/// Weight retained by a candidate directly behind the camera, relative to one
-/// straight ahead at the same distance. Not zero: turning around must not
-/// find an empty cache, and a point beside the camera is one flick of the
+/// The number of billboards at a given distance inside the view grows with
+/// the square of that distance, so the total weight of everything at one
+/// distance falls only when each billboard's weight falls faster than the
+/// square. A cube is the smallest whole power that does, which keeps near
+/// billboards first without starving far ones the way a Gaussian tail did.
+const UTILITY_DISTANCE_EXPONENT: i32 = 4;
+/// How many times farther a billboard directly behind the camera counts than
+/// one at the same distance straight ahead. Not infinite: turning around must
+/// not find an empty cache, and a point beside the camera is one flick of the
 /// mouse from being centre-screen.
-const LOAD_VALUE_BEHIND_WEIGHT: f32 = 0.12;
+const UTILITY_BEHIND_STRETCH: f32 = 8.0;
 
-/// How much of the camera's view a candidate occupies, as a weight in
-/// `(0, 1]`. This is the "p score": one number that folds together distance,
-/// where the camera is heading, and where it is looking.
-pub fn load_value(position: Vec3, view_position: Vec3, forward: Vec3, sigma: f32) -> f32 {
-    let offset = position - view_position;
+/// What showing the billboard at `offset` from the camera is worth, in
+/// `(0, 1]`: 1 straight ahead within one `reference_distance`, then falling
+/// with distance, faster the further the billboard sits from the view
+/// direction.
+pub fn load_utility(offset: Vec3, forward: Vec3, reference_distance: f32) -> f32 {
     let distance = offset.length();
-    let sigma = sigma.max(f32::EPSILON);
-    let proximity = (-0.5 * (distance / sigma).powi(2)).exp();
-    proximity * direction_weight(offset, distance, forward)
+    let alignment = if distance <= f32::EPSILON {
+        1.0
+    } else {
+        (offset / distance).dot(forward)
+    };
+    load_utility_at(distance, alignment, reference_distance)
 }
 
-/// Falls from 1.0 straight ahead to [`LOAD_VALUE_BEHIND_WEIGHT`] straight
-/// behind, following the cosine of the angle to the view axis so the
-/// transition through the edge of the screen is smooth rather than a cliff.
-fn direction_weight(offset: Vec3, distance: f32, forward: Vec3) -> f32 {
-    if distance <= f32::EPSILON {
-        return 1.0;
+/// [`load_utility`] from a distance and the cosine of the angle to the view
+/// direction. Increasing in `alignment` and decreasing in `distance`, so
+/// evaluating it at a region's nearest distance and best alignment bounds
+/// every billboard inside that region.
+pub fn load_utility_at(distance: f32, alignment: f32, reference_distance: f32) -> f32 {
+    let away = (1.0 - alignment.clamp(-1.0, 1.0)) * 0.5;
+    let stretch = 1.0 + (UTILITY_BEHIND_STRETCH - 1.0) * away;
+    // The stretch applies after the near clamp, so even a billboard
+    // touching the camera ranks below one in front of it.
+    let widths = (distance / reference_distance.max(1.0)).max(1.0) * stretch;
+    widths.powi(-UTILITY_DISTANCE_EXPONENT)
+}
+
+/// Half-angle of the cone ahead of the camera that [`cone_probes`] samples.
+/// Wider than a typical horizontal field of view, so a small turn does not
+/// leave what is now on screen unsampled.
+const PROBE_CONE_HALF_ANGLE: f32 = std::f32::consts::FRAC_PI_3;
+
+/// A position drawn ahead of the camera, with the probability density per
+/// unit volume it was drawn at.
+pub struct ConeProbe {
+    pub position: Vec3,
+    pub density: f32,
+}
+
+/// Draws `count` positions in the cone ahead of `origin`, uniform over
+/// directions in the cone and log-uniform in distance between `near` and
+/// `far`.
+///
+/// Log-uniform distance spreads probes as `1/r` per distance, over a shell
+/// area growing as `r^2`, so the density per unit volume falls as `1/r^3` —
+/// the same falloff as [`load_utility`] straight ahead. Regions are probed
+/// in proportion to what they are worth, which is what lets a fixed number
+/// of probes reach the whole depth of the view instead of the nearest cells.
+pub fn cone_probes(
+    origin: Vec3,
+    forward: Vec3,
+    near: f32,
+    far: f32,
+    count: usize,
+    rng: &mut Rng,
+) -> Vec<ConeProbe> {
+    let near = near.max(f32::EPSILON);
+    if far <= near {
+        return Vec::new();
     }
-    let alignment = (offset / distance).dot(forward).clamp(-1.0, 1.0);
-    let ahead = (alignment + 1.0) * 0.5;
-    LOAD_VALUE_BEHIND_WEIGHT + (1.0 - LOAD_VALUE_BEHIND_WEIGHT) * ahead
-}
-
-/// Selection sigma in world units for the current scene scale.
-pub fn load_value_sigma(reference_distance: f32) -> f32 {
-    reference_distance.max(1.0) * LOAD_VALUE_SIGMA_STEPS
+    let (across, up) = forward.any_orthonormal_pair();
+    let cos_limit = PROBE_CONE_HALF_ANGLE.cos();
+    let log_span = (far / near).ln();
+    let solid_angle = std::f32::consts::TAU * (1.0 - cos_limit);
+    (0..count)
+        .map(|_| {
+            let cos_angle = cos_limit + (1.0 - cos_limit) * rng.next_unit();
+            let sin_angle = (1.0 - cos_angle * cos_angle).max(0.0).sqrt();
+            let around = std::f32::consts::TAU * rng.next_unit();
+            let direction =
+                forward * cos_angle + (across * around.cos() + up * around.sin()) * sin_angle;
+            let distance = near * (log_span * rng.next_unit()).exp();
+            ConeProbe {
+                position: origin + direction * distance,
+                density: 1.0 / (distance.powi(3) * log_span * solid_angle),
+            }
+        })
+        .collect()
 }
 
 /// Draws up to `capacity` items without replacement, each with probability
@@ -145,10 +194,10 @@ impl<T> WeightedReservoir<T> {
 /// Seeded per frame from the frame counter so a run is reproducible and a
 /// test can assert an exact draw, rather than depending on thread-local
 /// entropy that would make selection unrepeatable across runs.
-struct Rng(u64);
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         // A zero state would make SplitMix64 emit a fixed sequence from a
         // degenerate start; the odd constant avoids that without changing
         // the distribution.
@@ -165,7 +214,7 @@ impl Rng {
 
     /// Uniform in the open interval `(0, 1)`; never returns exactly 0, whose
     /// `powf` key would collapse every weight to the same value.
-    fn next_unit(&mut self) -> f32 {
+    pub(crate) fn next_unit(&mut self) -> f32 {
         let bits = self.next_u64() >> 40; // 24 bits of mantissa
         (bits as f32 + 0.5) / (1u32 << 24) as f32
     }
@@ -175,30 +224,43 @@ impl Rng {
 mod tests {
     use super::*;
 
-    const SIGMA: f32 = 50.0;
+    const REFERENCE: f32 = 10.0;
 
     #[test]
-    fn value_peaks_at_the_camera_and_decays_with_distance() {
+    fn utility_peaks_at_the_camera_and_decays_with_distance() {
         let forward = Vec3::NEG_Z;
-        let at_camera = load_value(Vec3::ZERO, Vec3::ZERO, forward, SIGMA);
-        let near = load_value(Vec3::NEG_Z * 25.0, Vec3::ZERO, forward, SIGMA);
-        let far = load_value(Vec3::NEG_Z * 200.0, Vec3::ZERO, forward, SIGMA);
+        let at_camera = load_utility(Vec3::ZERO, forward, REFERENCE);
+        let near = load_utility(Vec3::NEG_Z * 25.0, forward, REFERENCE);
+        let far = load_utility(Vec3::NEG_Z * 200.0, forward, REFERENCE);
 
-        assert!(at_camera > near);
-        assert!(near > far);
+        assert_eq!(at_camera, 1.0);
+        assert!(near < at_camera);
+        assert!(far < near);
         assert!(far > 0.0, "no candidate is ever forbidden outright");
-        assert!(
-            far < near / 1_000.0,
-            "the tail must be thin enough that far points are effectively never drawn"
-        );
     }
 
     #[test]
-    fn points_ahead_outweigh_points_behind_at_equal_distance() {
+    fn total_weight_per_distance_falls_inside_the_view() {
+        // A view-cone shell at distance d holds ~d^2 billboards, so the
+        // per-distance total is d^2 times the utility. It must fall with
+        // distance, or far billboards would outnumber near ones in the draw.
+        let shell_total = |distance: f32| {
+            distance * distance * load_utility(Vec3::NEG_Z * distance, Vec3::NEG_Z, REFERENCE)
+        };
+        let mut previous = shell_total(REFERENCE);
+        for step in 2..40 {
+            let current = shell_total(REFERENCE * step as f32);
+            assert!(current < previous, "shell total rose at {step} widths");
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn points_ahead_outweigh_points_beside_and_behind() {
         let forward = Vec3::NEG_Z;
-        let ahead = load_value(Vec3::NEG_Z * 40.0, Vec3::ZERO, forward, SIGMA);
-        let beside = load_value(Vec3::X * 40.0, Vec3::ZERO, forward, SIGMA);
-        let behind = load_value(Vec3::Z * 40.0, Vec3::ZERO, forward, SIGMA);
+        let ahead = load_utility(Vec3::NEG_Z * 40.0, forward, REFERENCE);
+        let beside = load_utility(Vec3::X * 40.0, forward, REFERENCE);
+        let behind = load_utility(Vec3::Z * 40.0, forward, REFERENCE);
 
         assert!(ahead > beside);
         assert!(beside > behind);
@@ -206,15 +268,27 @@ mod tests {
             behind > 0.0,
             "turning around must not find an empty cache, so behind is down-weighted, not banned"
         );
+        // Behind counts as UTILITY_BEHIND_STRETCH times farther.
+        let as_far_ahead = load_utility(
+            Vec3::NEG_Z * 40.0 * UTILITY_BEHIND_STRETCH,
+            forward,
+            REFERENCE,
+        );
+        assert!((behind - as_far_ahead).abs() <= as_far_ahead * 1e-4);
     }
 
     #[test]
-    fn sigma_tracks_scene_scale() {
-        assert_eq!(load_value_sigma(10.0), 10.0 * LOAD_VALUE_SIGMA_STEPS);
-        assert_eq!(load_value_sigma(40.0), 40.0 * LOAD_VALUE_SIGMA_STEPS);
-        // A degenerate scene scale still yields a usable sigma rather than
-        // collapsing the sample to the camera's exact position.
-        assert!(load_value_sigma(0.0) > 0.0);
+    fn utility_is_bounded_by_its_value_at_nearest_distance_and_best_alignment() {
+        let bound = load_utility_at(30.0, 0.5, REFERENCE);
+        for (distance, alignment) in [(30.0, 0.5), (31.0, 0.5), (30.0, 0.2), (60.0, -1.0)] {
+            assert!(load_utility_at(distance, alignment, REFERENCE) <= bound);
+        }
+    }
+
+    #[test]
+    fn a_degenerate_scene_scale_still_yields_a_usable_utility() {
+        let utility = load_utility(Vec3::NEG_Z * 3.0, Vec3::NEG_Z, 0.0);
+        assert!(utility > 0.0 && utility <= 1.0);
     }
 
     #[test]
@@ -285,6 +359,38 @@ mod tests {
 
         assert_eq!(draw(42), draw(42));
         assert_ne!(draw(42), draw(43));
+    }
+
+    #[test]
+    fn cone_probes_stay_in_the_cone_and_range_with_the_stated_density() {
+        let mut rng = Rng::new(3);
+        let forward = Vec3::NEG_Z;
+        let probes = cone_probes(Vec3::ZERO, forward, 2.0, 50.0, 2_000, &mut rng);
+        assert_eq!(probes.len(), 2_000);
+        let cos_limit = PROBE_CONE_HALF_ANGLE.cos();
+        for probe in &probes {
+            let distance = probe.position.length();
+            assert!((2.0..=50.0 + 1e-3).contains(&distance));
+            assert!(probe.position.normalize().dot(forward) >= cos_limit - 1e-5);
+            let expected = 1.0
+                / (distance.powi(3)
+                    * (50.0f32 / 2.0).ln()
+                    * std::f32::consts::TAU
+                    * (1.0 - cos_limit));
+            assert!((probe.density - expected).abs() <= expected * 1e-4);
+        }
+        // Log-uniform: as many probes between 2 and 10 as between 10 and 50.
+        let inner = probes
+            .iter()
+            .filter(|probe| probe.position.length() < 10.0)
+            .count();
+        assert!((800..1_200).contains(&inner), "{inner} of 2000 inside 10");
+    }
+
+    #[test]
+    fn cone_probes_need_a_range() {
+        let mut rng = Rng::new(3);
+        assert!(cone_probes(Vec3::ZERO, Vec3::NEG_Z, 5.0, 5.0, 10, &mut rng).is_empty());
     }
 
     #[test]

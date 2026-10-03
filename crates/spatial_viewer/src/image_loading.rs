@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -9,8 +10,8 @@ use ab_glyph::FontArc;
 use bevy::{math::primitives::Rectangle, prelude::*};
 use spatial_geometry::normalized_or;
 use spatial_viewer_ui::{
-    BillboardControls, BillboardFacingAxis, BillboardFacingSettings, BillboardStats,
-    NavigationSettings, PauseMenuState,
+    BillboardCacheChurn, BillboardControls, BillboardFacingAxis, BillboardFacingSettings,
+    BillboardStats, NavigationSettings, PauseMenuState,
 };
 
 use crate::{
@@ -18,7 +19,7 @@ use crate::{
     background_work::{spawn_background, CancelToken, CompletedWork},
     decode_budget::DecodeBudget,
     folders::BillboardGrowth,
-    load_sampling::{load_value, load_value_sigma, WeightedReservoir},
+    load_sampling::{cone_probes, load_utility, load_utility_at, Rng, WeightedReservoir},
     media_decode::{
         billboard_surface_bytes, billboard_surface_to_bevy_image, decode_video_still,
         encode_billboard_surface, fit_image_to_square, open_image_file, BillboardTextureEncoding,
@@ -45,7 +46,6 @@ const COORDINATE_LABEL_FONT_SIZE: f32 = 46.0;
 
 const BILLBOARD_ORIENTATION_MAX_DISTANCE_FACTOR: f32 = 96.0;
 const BILLBOARD_NEAR_VISIBLE_DOT: f32 = -0.15;
-const BILLBOARD_GRID_LOCAL_RADIUS: i32 = 6;
 const BILLBOARD_PENDING_FALLBACK_CELL_LIMIT: usize = 64;
 const BILLBOARD_COORDINATE_LABEL_SPAWNS_PER_FRAME: usize = 2;
 const BILLBOARD_RECEIVE_MAX_UPLOADS_PER_FRAME: usize = 8;
@@ -77,11 +77,22 @@ const BILLBOARD_QUALITY_LOOKAHEAD_SECONDS: f32 = 0.75;
 /// it a fast cruise would place the projected camera far across the catalog
 /// and ask for full quality nearly everywhere.
 const BILLBOARD_QUALITY_LOOKAHEAD_MAX_STEPS: f32 = 12.0;
-/// Pending cells inspected per frame while offering candidates to the
-/// sampler. The walk starts at the camera and spirals outward, so this bounds
-/// the per-frame cost without biasing *which* points win: the sample is
-/// weighted, and cells near the camera are visited first and every frame.
+/// Populated cells whose points are offered to the sampler per frame. The
+/// walk visits cells in order of the most any point inside them could be
+/// worth, so this bounds the per-frame cost while spending it on the cells
+/// the draw would favour anyway.
 const BILLBOARD_PENDING_CELLS_PER_FRAME: usize = 192;
+/// Cells the walk may examine per frame, populated or not. Bounds the cost
+/// of crossing empty space in a sparse catalog; the size of the 13-cell cube
+/// the walk used to search.
+const BILLBOARD_PENDING_CELL_LOOKUPS_PER_FRAME: usize = 2_197;
+/// Positions sampled ahead of the camera per frame, beyond what the walk
+/// covered, so the far part of the view is offered to the draw too.
+const BILLBOARD_FAR_PROBES_PER_FRAME: usize = 64;
+/// How many times more an image must be worth than each resident it would
+/// displace before a decode is started to replace them. See
+/// [`DisplacementBar::ToStart`].
+const BILLBOARD_REPLACEMENT_START_VALUE_RATIO: f32 = 4.0;
 
 /// Every billboard is drawn at its layout's size times its growth.
 #[derive(Component)]
@@ -271,6 +282,12 @@ pub struct ImageLoadingState {
     /// Running total of how alpha classification encoded every image
     /// decoded this run.
     encode_tally: SurfaceEncodeTally,
+    /// Running total of evictions and the work they cost this run.
+    cache_churn: BillboardCacheChurn,
+    /// Images evicted from the current catalog, so a later admission of one
+    /// can be counted as a reload. Cleared with the catalog, because image
+    /// ids are only unique within one.
+    evicted_ids: HashSet<usize>,
 }
 
 struct InFlightLoad {
@@ -278,6 +295,10 @@ struct InFlightLoad {
     texture_limit: u32,
     /// Cancels this decode when its billboard is evicted before it finishes.
     cancel: CancelToken,
+    /// Residents this load was scheduled to displace. They stay on screen
+    /// until it lands, but their room is already spoken for: no other load
+    /// may count on it, and the budget treats it as freed.
+    reserved_victims: Vec<usize>,
 }
 
 struct LoadedBillboardRecord {
@@ -377,6 +398,55 @@ struct SpatialCell {
     z: i32,
 }
 
+impl SpatialCell {
+    /// The six cells sharing a face with this one.
+    fn face_neighbours(self) -> [SpatialCell; 6] {
+        let Self { x, y, z } = self;
+        [
+            Self { x: x - 1, y, z },
+            Self { x: x + 1, y, z },
+            Self { x, y: y - 1, z },
+            Self { x, y: y + 1, z },
+            Self { x, y, z: z - 1 },
+            Self { x, y, z: z + 1 },
+        ]
+    }
+}
+
+/// A cell waiting to be visited by the pending walk, ordered by the most any
+/// point inside it could be worth; ties fall back to the cell so the order
+/// never depends on insertion order.
+struct CellVisit {
+    bound: f32,
+    cell: SpatialCell,
+}
+
+impl Ord for CellVisit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.bound
+            .total_cmp(&other.bound)
+            .then_with(|| other.cell.cmp(&self.cell))
+    }
+}
+
+impl PartialOrd for CellVisit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for CellVisit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for CellVisit {}
+
+/// Keeps the far-probe stream independent of the reservoir's, which is
+/// seeded with the same per-frame seed.
+const FAR_PROBE_SEED_SALT: u64 = 0x5eed_f00d_cafe_d00d;
+
 /// Pending-load spatial index for a whole point set, built ahead of a scene
 /// reset (on the catalog load thread) so the reset itself is O(1).
 pub struct PreparedPendingIndex(SpatialPendingIndex);
@@ -394,6 +464,15 @@ pub struct SpatialPendingIndex {
     cells: HashMap<SpatialCell, Vec<BillboardPoint>>,
     ids: HashSet<usize>,
     len: usize,
+    /// Smallest and largest cell coordinates ever populated, so the walk
+    /// does not wander into empty space outside the catalog.
+    cell_min: SpatialCell,
+    cell_max: SpatialCell,
+    /// Per-frame scratch for the walk, kept to reuse its allocations.
+    walk_frontier: BinaryHeap<CellVisit>,
+    walk_queued: HashSet<SpatialCell>,
+    /// Cells whose points were offered this frame, by the walk or a probe.
+    walk_offered: HashSet<SpatialCell>,
 }
 
 pub fn create_billboard_mesh(meshes: &mut Assets<Mesh>, world_size: f32) -> BillboardMesh {
@@ -422,6 +501,8 @@ impl ImageLoadingState {
             last_upload_count: 0,
             last_upload_bytes: 0,
             encode_tally: SurfaceEncodeTally::default(),
+            cache_churn: BillboardCacheChurn::default(),
+            evicted_ids: HashSet::new(),
         }
     }
 
@@ -445,6 +526,7 @@ impl ImageLoadingState {
             load.cancel.cancel();
         }
         self.failed.clear();
+        self.evicted_ids.clear();
         self.completed = CompletedWork::default();
         self.texture_budget_bytes = texture_budget_bytes;
         self.max_in_flight = max_in_flight.max(1);
@@ -563,14 +645,18 @@ impl ImageLoadingState {
         self.pending.insert(point);
     }
 
-    /// VRAM the resident textures occupy, plus what the in-flight decodes
-    /// will occupy when they land.
+    /// VRAM the cache is committed to once everything in flight has landed:
+    /// the resident textures, plus what the in-flight decodes will occupy,
+    /// less the residents those decodes will displace.
     ///
     /// In-flight loads are charged before they arrive because a decode takes
     /// hundreds of milliseconds: a budget that only counted what had already
     /// landed would admit a whole frame's worth of scheduling and overshoot
-    /// once they all completed.
-    fn loaded_bytes_used(&self) -> usize {
+    /// once they all completed. Their reserved victims are credited for the
+    /// same reason in reverse: charging an arrival without crediting what it
+    /// replaces made the cache read as over budget, so residents were evicted
+    /// before their replacements were ready to take their place.
+    fn committed_texture_bytes(&self) -> usize {
         let resident: usize = self
             .loaded
             .values()
@@ -582,7 +668,21 @@ impl ImageLoadingState {
             .filter(|(image_id, _)| !self.loaded.contains_key(image_id))
             .map(|(_, load)| load.point.texture_bytes(self.texture_format))
             .sum();
-        resident + incoming
+        let displaced: usize = self
+            .reserved_victims()
+            .iter()
+            .filter_map(|image_id| self.loaded.get(image_id))
+            .map(|record| record.point.texture_bytes(self.texture_format))
+            .sum();
+        (resident + incoming).saturating_sub(displaced)
+    }
+
+    /// Residents some in-flight load is scheduled to displace.
+    fn reserved_victims(&self) -> HashSet<usize> {
+        self.in_flight
+            .values()
+            .flat_map(|load| load.reserved_victims.iter().copied())
+            .collect()
     }
 
     /// Poster decodes currently running, counted against the decode budget.
@@ -624,7 +724,7 @@ impl ImageLoadingState {
 
     /// Whether admitting `point` would exceed the VRAM budget.
     fn cache_is_full_for(&self, point: &BillboardPoint) -> bool {
-        self.loaded_bytes_used() + point.texture_bytes(self.texture_format)
+        self.committed_texture_bytes() + point.texture_bytes(self.texture_format)
             > self.texture_budget_bytes
     }
 
@@ -632,7 +732,7 @@ impl ImageLoadingState {
         // Never evict the last resident billboard: a budget smaller than one
         // image would otherwise evict everything and re-decode forever,
         // showing an empty view instead of one image.
-        self.loaded.len() > 1 && self.loaded_bytes_used() > self.texture_budget_bytes
+        self.loaded.len() > 1 && self.committed_texture_bytes() > self.texture_budget_bytes
     }
 
     /// Cancels in-flight decodes for points the camera can no longer reach,
@@ -661,13 +761,102 @@ impl ImageLoadingState {
         cancelled
     }
 
-    fn farthest_loaded_billboard(&self, view: SchedulingView) -> Option<usize> {
-        self.loaded
+    /// Draws up to `capacity` pending points to decode, removing them from
+    /// the pending index.
+    ///
+    /// Taking points out of the index to offer them would strand the ones not
+    /// drawn, so candidates are referenced by cell and index and only the
+    /// drawn ones are removed.
+    fn draw_load_candidates(
+        &mut self,
+        valuation: Valuation,
+        capacity: usize,
+    ) -> Vec<BillboardPoint> {
+        let seed = self.next_sample_seed();
+        let gate = self.admission_gate(valuation);
+        let mut reservoir = WeightedReservoir::new(capacity, seed);
+        self.pending
+            .offer_candidates(&mut reservoir, valuation, gate, seed);
+        self.pending.take_candidates(reservoir.take())
+    }
+
+    /// Which candidates the cache could take right now: any that fit the
+    /// room left, and otherwise only those that clear the bar to start
+    /// displacing the least valuable unreserved resident, which is the first
+    /// a replacement would evict.
+    fn admission_gate(&self, valuation: Valuation) -> AdmissionGate {
+        let reserved = self.reserved_victims();
+        AdmissionGate {
+            free_bytes: self
+                .texture_budget_bytes
+                .saturating_sub(self.committed_texture_bytes()),
+            displacement_floor: self
+                .loaded
+                .values()
+                .filter(|record| !reserved.contains(&record.point.image_id))
+                .map(|record| valuation.of(record.point.position))
+                .fold(f32::INFINITY, f32::min)
+                * DisplacementBar::ToStart.value_ratio(),
+            texture_format: self.texture_format,
+        }
+    }
+
+    /// Resident image ids, least valuable first: the order in which they give
+    /// up their room. Ties fall back to the image id so the order does not
+    /// depend on hash-map iteration.
+    fn eviction_order(&self, valuation: Valuation) -> Vec<usize> {
+        let mut valued = self
+            .loaded
             .values()
-            .max_by(|left, right| {
-                loaded_eviction_score(left, view).total_cmp(&loaded_eviction_score(right, view))
-            })
-            .map(|record| record.point.image_id)
+            .map(|record| (valuation.of(record.point.position), record.point.image_id))
+            .collect::<Vec<_>>();
+        valued.sort_unstable_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        valued.into_iter().map(|(_, image_id)| image_id).collect()
+    }
+
+    /// The residents to evict so `candidate` fits the VRAM budget, taken
+    /// from the front of `eviction_order`, skipping any another load has
+    /// already reserved, or `None` when it cannot be made to fit without displacing
+    /// an image worth more than it.
+    ///
+    /// The set is all-or-nothing. Images differ ~100x in size, so one evicted
+    /// resident often frees far less than a large arrival needs; evicting it
+    /// anyway and then dropping the arrival for lack of room cost both
+    /// images, and each was redrawn, reloaded and displaced again.
+    fn replacement_victims(
+        &self,
+        candidate: &BillboardPoint,
+        valuation: Valuation,
+        eviction_order: &[usize],
+        bar: DisplacementBar,
+    ) -> Option<Vec<usize>> {
+        let mut excess = (self.committed_texture_bytes()
+            + candidate.texture_bytes(self.texture_format))
+        .saturating_sub(self.texture_budget_bytes);
+        let reserved = self.reserved_victims();
+        let mut victims = Vec::new();
+        for image_id in eviction_order {
+            if excess == 0 {
+                break;
+            }
+            if reserved.contains(image_id) {
+                continue;
+            }
+            let resident = self
+                .loaded
+                .get(image_id)
+                .expect("eviction order is taken from the current residents");
+            if !replacement_improves_cache(candidate, resident, valuation, bar) {
+                return None;
+            }
+            excess = excess.saturating_sub(resident.point.texture_bytes(self.texture_format));
+            victims.push(*image_id);
+        }
+        (excess == 0).then_some(victims)
     }
 }
 
@@ -706,6 +895,12 @@ pub fn schedule_image_loads(
 
     let view = scheduling_view(camera_query.get_single().ok(), &navigation);
 
+    let valuation = Valuation {
+        view,
+        bounds: &view_bounds,
+        reference_distance: navigation.reference_distance,
+    };
+
     // Free workers held by decodes the camera has put out of reach before
     // this frame's scheduling looks for capacity.
     state.cancel_unreachable_loads(view, &view_bounds);
@@ -716,7 +911,7 @@ pub fn schedule_image_loads(
         &mut images,
         &mut materials,
         &mut cloud,
-        view,
+        valuation,
     );
 
     // Fill every free worker from ONE weighted sample over all candidates.
@@ -732,49 +927,50 @@ pub fn schedule_image_loads(
     if capacity == 0 {
         return;
     }
-    let sigma = load_value_sigma(navigation.reference_distance);
-    let mut reservoir = WeightedReservoir::new(capacity, state.next_sample_seed());
-
-    // Points with no texture yet, offered from the cells nearest the camera
-    // outward. Taking them out of the index to offer them would strand the
-    // ones not drawn, so candidates are referenced by cell and index and only
-    // the drawn ones are removed.
     // A full cache does not stop first loads: one replacement at a time may
     // still displace a worse-placed resident, which is how camera movement
     // improves cache locality. The gate above is on workers, not on slots.
-    state
-        .pending
-        .offer_candidates(&mut reservoir, view, &view_bounds, sigma);
-
-    let first_loads = reservoir.take();
-    for point in state.pending.take_candidates(first_loads) {
+    let first_loads = state.draw_load_candidates(valuation, capacity);
+    // Residents do not change while this frame schedules, so the order they
+    // would give up room in is computed at most once, and only if needed.
+    let mut eviction_order = None;
+    for point in first_loads {
         if budget.take_allowance(1) == 0 {
             state.pending.insert(point);
             continue;
         }
-        // Once the cache is full a new load must displace a resident, and
-        // only one such replacement may be in flight: the resident stays
-        // visible until its replacement is ready, and receive_image_loads
-        // performs the swap.
-        if state.cache_is_full_for(&point) {
-            let replaces_a_worse_resident = state
-                .farthest_loaded_billboard(view)
-                .and_then(|image_id| state.loaded.get(&image_id))
-                .is_some_and(|resident| replacement_improves_cache(&point, resident, view));
-            let replacement_in_flight = state
-                .in_flight
-                .keys()
-                .any(|image_id| !state.loaded.contains_key(image_id));
-            if !replaces_a_worse_resident || replacement_in_flight {
+        // Once the cache is full a new load must displace residents. It
+        // reserves them, so any number of replacements can be in flight
+        // without two counting on the same room; the residents stay visible
+        // until their replacement is ready, and receive_image_loads performs
+        // the swap.
+        let reserved_victims = if state.cache_is_full_for(&point) {
+            let eviction_order =
+                eviction_order.get_or_insert_with(|| state.eviction_order(valuation));
+            let Some(victims) = state.replacement_victims(
+                &point,
+                valuation,
+                eviction_order,
+                DisplacementBar::ToStart,
+            ) else {
                 state.pending.insert(point);
                 continue;
-            }
-        }
+            };
+            victims
+        } else {
+            Vec::new()
+        };
         let texture_limit = billboard_texture_limit(&controls, *texture_encoding, point.is_video);
         let video_still_seconds = point
             .is_video
             .then(|| video_still_times.still_seconds(point.image_id, &point.path));
-        start_image_load(&mut state, point, texture_limit, video_still_seconds);
+        start_image_load(
+            &mut state,
+            point,
+            texture_limit,
+            video_still_seconds,
+            reserved_victims,
+        );
     }
 }
 
@@ -794,7 +990,7 @@ pub fn publish_image_loading_stats(
     stats.uploaded_textures = state.last_upload_count;
     stats.uploaded_bytes = state.last_upload_bytes;
     stats.upload_queue = state.completed.len();
-    stats.texture_bytes_used = state.loaded_bytes_used();
+    stats.texture_bytes_used = state.committed_texture_bytes();
     stats.texture_budget_bytes = state.texture_budget_bytes;
 
     let view = scheduling_view(camera_query.get_single().ok(), &navigation);
@@ -809,6 +1005,7 @@ pub fn publish_image_loading_stats(
     stats.encode_mixed_texels = tally.mixed_texels;
     stats.encode_opaque_nanos = tally.opaque_encode_nanos;
     stats.encode_mixed_nanos = tally.mixed_encode_nanos;
+    stats.cache_churn = state.cache_churn;
 }
 
 /// Points near enough and in front of the camera to be worth showing, and
@@ -852,6 +1049,7 @@ pub fn receive_image_loads(
     billboard_mesh: Res<BillboardMesh>,
     billboard_world_size: Res<BillboardWorldSize>,
     navigation: Res<NavigationSettings>,
+    view_bounds: Res<ViewBounds>,
     camera_query: Query<(&Transform, &FlyCamera)>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -937,10 +1135,6 @@ pub fn receive_image_loads(
         }
 
         let point = in_flight.point.clone();
-        let current_limit = state
-            .loaded
-            .get(&point.image_id)
-            .map(|record| record.texture_limit);
 
         if let Ok(decoded) = &mut completed.result {
             if let Some(surface) = decoded.surface.take() {
@@ -971,31 +1165,6 @@ pub fn receive_image_loads(
         state.in_flight.remove(&point.image_id);
         match completed.result {
             Ok(decoded) => {
-                if current_limit.is_none() && state.cache_is_full_for(&point) {
-                    let replacement = state.farthest_loaded_billboard(view).filter(|image_id| {
-                        state.loaded.get(image_id).is_some_and(|resident| {
-                            replacement_improves_cache(&point, resident, view)
-                        })
-                    });
-                    let Some(image_id) = replacement else {
-                        remove_uploaded_billboard_surface(
-                            &completed.uploaded_surface,
-                            &mut images,
-                            &mut materials,
-                        );
-                        state.return_to_pending(point);
-                        continue;
-                    };
-                    evict_loaded_billboard(
-                        &mut commands,
-                        &mut state,
-                        image_id,
-                        &mut images,
-                        &mut materials,
-                        &mut cloud,
-                        true,
-                    );
-                }
                 let texture_side = decoded.side;
 
                 if let Some(record) = state.loaded.get(&point.image_id) {
@@ -1028,14 +1197,46 @@ pub fn receive_image_loads(
                     continue;
                 }
 
-                if state.cache_is_full_for(&point) {
+                // A new billboard needs room. Residents are evicted only once
+                // it is certain their combined room admits it; otherwise it
+                // is dropped and nothing is displaced.
+                let valuation = Valuation {
+                    view,
+                    bounds: &view_bounds,
+                    reference_distance: navigation.reference_distance,
+                };
+                let victims = if state.cache_is_full_for(&point) {
+                    let eviction_order = state.eviction_order(valuation);
+                    state.replacement_victims(
+                        &point,
+                        valuation,
+                        &eviction_order,
+                        DisplacementBar::OnArrival,
+                    )
+                } else {
+                    Some(Vec::new())
+                };
+                let Some(victims) = victims else {
                     remove_uploaded_billboard_surface(
                         &completed.uploaded_surface,
                         &mut images,
                         &mut materials,
                     );
+                    state.cache_churn.discarded_decodes += 1;
                     state.return_to_pending(point);
                     continue;
+                };
+                let into_free_room = victims.is_empty();
+                for image_id in victims {
+                    evict_loaded_billboard(
+                        &mut commands,
+                        &mut state,
+                        image_id,
+                        &mut images,
+                        &mut materials,
+                        &mut cloud,
+                        EvictionCause::Arrival,
+                    );
                 }
 
                 let entity = commands
@@ -1066,6 +1267,12 @@ pub fn receive_image_loads(
                 spawned_billboards += 1;
 
                 cloud.set_point_visible(point.image_id, false);
+                if state.evicted_ids.contains(&point.image_id) {
+                    state.cache_churn.reloads += 1;
+                    if into_free_room {
+                        state.cache_churn.reloads_into_free_room += 1;
+                    }
+                }
                 state.loaded.insert(
                     point.image_id,
                     LoadedBillboardRecord {
@@ -1097,7 +1304,7 @@ pub fn receive_image_loads(
     }
 
     let completed_count = state.loaded.len() + state.failed.len();
-    let finished_loading_window = state.loaded_bytes_used() >= state.texture_budget_bytes
+    let finished_loading_window = state.committed_texture_bytes() >= state.texture_budget_bytes
         || (state.pending.is_empty() && state.in_flight.is_empty() && state.completed.is_empty());
     if completed_count >= state.last_reported_completed + 50
         || (finished_loading_window && completed_count != state.last_reported_completed)
@@ -1109,7 +1316,7 @@ pub fn receive_image_loads(
             state.in_flight.len(),
             state.pending.len(),
             state.completed.len(),
-            state.loaded_bytes_used() as f64 / (1024.0 * 1024.0 * 1024.0),
+            state.committed_texture_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
             state.texture_budget_bytes / (1024 * 1024 * 1024),
         );
         state.last_reported_completed = completed_count;
@@ -1416,14 +1623,40 @@ fn evict_over_cache_limit(
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     cloud: &mut PointCloud,
-    view: SchedulingView,
+    valuation: Valuation,
 ) {
-    while state.cache_over_limit() && !state.loaded.is_empty() {
-        let Some(image_id) = state.farthest_loaded_billboard(view) else {
-            break;
-        };
-        evict_loaded_billboard(commands, state, image_id, images, materials, cloud, true);
+    if !state.cache_over_limit() {
+        return;
     }
+    // A reserved resident's room is already credited to the budget, so
+    // evicting it early would free nothing the budget does not count.
+    let reserved = state.reserved_victims();
+    for image_id in state.eviction_order(valuation) {
+        if !state.cache_over_limit() {
+            break;
+        }
+        if reserved.contains(&image_id) {
+            continue;
+        }
+        evict_loaded_billboard(
+            commands,
+            state,
+            image_id,
+            images,
+            materials,
+            cloud,
+            EvictionCause::OverBudget,
+        );
+    }
+}
+
+/// Why a resident gave up its texture, so churn can be attributed.
+#[derive(Clone, Copy)]
+enum EvictionCause {
+    /// An arriving decode needed its room.
+    Arrival,
+    /// The cache, counting decodes still in flight, was over its budget.
+    OverBudget,
 }
 
 fn evict_loaded_billboard(
@@ -1433,7 +1666,7 @@ fn evict_loaded_billboard(
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     cloud: &mut PointCloud,
-    return_to_pending: bool,
+    cause: EvictionCause,
 ) {
     // Any refresh still decoding for this billboard is now for a texture
     // nothing will display.
@@ -1446,18 +1679,23 @@ fn evict_loaded_billboard(
     commands.entity(record.entity).despawn_recursive();
     record.surface_assets.remove(images, materials);
     cloud.set_point_visible(record.point.image_id, true);
-    if return_to_pending {
-        state.return_to_pending(record.point);
+    match cause {
+        EvictionCause::Arrival => state.cache_churn.evicted_for_arrivals += 1,
+        EvictionCause::OverBudget => state.cache_churn.evicted_over_budget += 1,
     }
+    state.evicted_ids.insert(image_id);
+    state.return_to_pending(record.point);
 }
 
 /// `video_still_seconds` is `Some` for a video: the time its still frame is
-/// decoded at (see [`VideoStillTimes`]).
+/// decoded at (see [`VideoStillTimes`]). `reserved_victims` are the
+/// residents it will displace, empty when it fits the room left.
 fn start_image_load(
     state: &mut ImageLoadingState,
     point: BillboardPoint,
     texture_limit: u32,
     video_still_seconds: Option<f32>,
+    reserved_victims: Vec<usize>,
 ) {
     let cancel = CancelToken::new();
     state.in_flight.insert(
@@ -1466,6 +1704,7 @@ fn start_image_load(
             point: point.clone(),
             texture_limit,
             cancel: cancel.clone(),
+            reserved_victims,
         },
     );
 
@@ -1634,6 +1873,19 @@ impl SpatialPendingIndex {
             cells: HashMap::new(),
             ids: HashSet::new(),
             len: 0,
+            cell_min: SpatialCell {
+                x: i32::MAX,
+                y: i32::MAX,
+                z: i32::MAX,
+            },
+            cell_max: SpatialCell {
+                x: i32::MIN,
+                y: i32::MIN,
+                z: i32::MIN,
+            },
+            walk_frontier: BinaryHeap::new(),
+            walk_queued: HashSet::new(),
+            walk_offered: HashSet::new(),
         };
         for point in points {
             index.insert(point);
@@ -1646,73 +1898,247 @@ impl SpatialPendingIndex {
             return;
         }
         let cell = self.cell_for(point.position);
+        self.cell_min = SpatialCell {
+            x: self.cell_min.x.min(cell.x),
+            y: self.cell_min.y.min(cell.y),
+            z: self.cell_min.z.min(cell.z),
+        };
+        self.cell_max = SpatialCell {
+            x: self.cell_max.x.max(cell.x),
+            y: self.cell_max.y.max(cell.y),
+            z: self.cell_max.z.max(cell.z),
+        };
         self.cells.entry(cell).or_default().push(point);
         self.len += 1;
     }
 
-    /// Offers pending points to the sampler, walking cells outward from the
-    /// camera.
+    /// Distance from `origin` to the farthest corner of the populated cell
+    /// range: how far into the catalog the view can reach.
+    fn farthest_cell_distance(&self, origin: Vec3) -> f32 {
+        if self.cell_min.x > self.cell_max.x {
+            return 0.0;
+        }
+        let minimum = Vec3::new(
+            self.cell_min.x as f32,
+            self.cell_min.y as f32,
+            self.cell_min.z as f32,
+        ) * self.cell_size;
+        let maximum = Vec3::new(
+            (self.cell_max.x + 1) as f32,
+            (self.cell_max.y + 1) as f32,
+            (self.cell_max.z + 1) as f32,
+        ) * self.cell_size;
+        let farthest = Vec3::new(
+            if origin.x - minimum.x > maximum.x - origin.x {
+                minimum.x
+            } else {
+                maximum.x
+            },
+            if origin.y - minimum.y > maximum.y - origin.y {
+                minimum.y
+            } else {
+                maximum.y
+            },
+            if origin.z - minimum.z > maximum.z - origin.z {
+                minimum.z
+            } else {
+                maximum.z
+            },
+        );
+        farthest.distance(origin)
+    }
+
+    fn contains_cell_range(&self, cell: SpatialCell) -> bool {
+        (self.cell_min.x..=self.cell_max.x).contains(&cell.x)
+            && (self.cell_min.y..=self.cell_max.y).contains(&cell.y)
+            && (self.cell_min.z..=self.cell_max.z).contains(&cell.z)
+    }
+
+    /// The most [`candidate_value`] could be for any point inside `cell`:
+    /// the utility at the cell's nearest distance and its best alignment
+    /// with the view, from whichever camera position is more favourable;
+    /// zero when the whole cell is beyond the render boundary.
+    fn cell_value_bound(&self, cell: SpatialCell, valuation: Valuation) -> f32 {
+        let Valuation {
+            view,
+            bounds,
+            reference_distance,
+        } = valuation;
+        let minimum = Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32) * self.cell_size;
+        let maximum = minimum + Vec3::splat(self.cell_size);
+        // Clamping gives the cell's nearest point on every axis at once, so
+        // if even it is beyond the boundary, every point in the cell is.
+        if bounds.is_beyond(view.position, view.position.clamp(minimum, maximum)) {
+            return 0.0;
+        }
+        let centre = (minimum + maximum) * 0.5;
+        let radius = self.cell_size * 3f32.sqrt() * 0.5;
+        let bound_from = |origin: Vec3| {
+            let nearest = origin.clamp(minimum, maximum).distance(origin);
+            let to_centre = centre - origin;
+            let centre_distance = to_centre.length();
+            if centre_distance <= radius {
+                return load_utility_at(nearest, 1.0, reference_distance);
+            }
+            // The cell lies inside a cone of half-angle asin(radius /
+            // distance) around its centre, so its best alignment is the
+            // centre's angle to the view axis less that half-angle.
+            let sin_spread = radius / centre_distance;
+            let cos_spread = (1.0 - sin_spread * sin_spread).sqrt();
+            let cos_centre = to_centre.dot(view.forward) / centre_distance;
+            let sin_centre = (1.0 - cos_centre * cos_centre).max(0.0).sqrt();
+            let best_alignment = if cos_centre >= cos_spread {
+                1.0
+            } else {
+                cos_centre * cos_spread + sin_centre * sin_spread
+            };
+            load_utility_at(nearest, best_alignment, reference_distance)
+        };
+        bound_from(view.position).max(bound_from(view.lookahead_position))
+    }
+
+    /// Offers pending points to the sampler, walking cells in order of the
+    /// most any point inside them could be worth.
     ///
     /// Points are offered by reference (cell plus index) rather than removed:
     /// a removed candidate that lost the draw would have to be reinserted,
     /// and reinsertion invalidates the indices of everything offered after
     /// it. Only the drawn points are taken, in [`Self::take_candidates`].
     ///
-    /// The outward walk is what keeps this affordable on a large catalog. It
-    /// visits at most [`BILLBOARD_PENDING_CELLS_PER_FRAME`] cells, but always
-    /// the nearest ones first, so the points that dominate the weighting are
-    /// offered every frame while the far tail is merely sampled over time.
+    /// The walk is what keeps this affordable on a large catalog. It is a
+    /// best-first flood from the camera's cell: each step visits the queued
+    /// cell with the highest [`Self::cell_value_bound`] and queues its
+    /// neighbours. The utility falls slowly ahead and fast behind, so the
+    /// visited region stretches out along the view instead of being a cube
+    /// around the camera, and the [`BILLBOARD_PENDING_CELLS_PER_FRAME`]
+    /// budget goes to the cells the draw would favour.
+    ///
+    /// The budget still ends the walk a few widths out in a dense catalog,
+    /// while the utility gives everything farther along the view a real
+    /// share. That far part is sampled rather than walked:
+    /// [`BILLBOARD_FAR_PROBES_PER_FRAME`] positions drawn by [`cone_probes`]
+    /// each offer the points of the cell they land in, weighted by their
+    /// value over the chance that cell was probed. A cell probed one frame
+    /// in a hundred is offered at a hundred times its value, so across
+    /// frames the draw follows the utility the whole way out.
+    ///
+    /// Candidates `gate` rules out are not offered at all, and a cell holding
+    /// only those does not count against the budget: with the cache full, a
+    /// draw spent on an image that cannot displace anything does no work.
     fn offer_candidates(
         &mut self,
         reservoir: &mut WeightedReservoir<LoadCandidate>,
-        view: SchedulingView,
-        view_bounds: &ViewBounds,
-        sigma: f32,
+        valuation: Valuation,
+        gate: AdmissionGate,
+        seed: u64,
     ) {
+        let Valuation {
+            view,
+            reference_distance,
+            ..
+        } = valuation;
         if self.cells.is_empty() {
             return;
         }
 
-        let camera_cell = self.cell_for(view.position);
-        let mut cells_visited = 0;
+        let mut frontier = std::mem::take(&mut self.walk_frontier);
+        let mut queued = std::mem::take(&mut self.walk_queued);
+        let mut offered = std::mem::take(&mut self.walk_offered);
+        frontier.clear();
+        queued.clear();
+        offered.clear();
+        for start in [
+            self.cell_for(view.position),
+            self.cell_for(view.lookahead_position),
+        ] {
+            if queued.insert(start) {
+                frontier.push(CellVisit {
+                    bound: self.cell_value_bound(start, valuation),
+                    cell: start,
+                });
+            }
+        }
+
+        let mut lookups = 0;
+        let mut cells_offered = 0;
         let mut offers = Vec::new();
-        'outward: for radius in 0..=BILLBOARD_GRID_LOCAL_RADIUS {
-            for x in (camera_cell.x - radius)..=(camera_cell.x + radius) {
-                for y in (camera_cell.y - radius)..=(camera_cell.y + radius) {
-                    for z in (camera_cell.z - radius)..=(camera_cell.z + radius) {
-                        if radius > 0
-                            && (x - camera_cell.x)
-                                .abs()
-                                .max((y - camera_cell.y).abs())
-                                .max((z - camera_cell.z).abs())
-                                != radius
-                        {
-                            continue;
-                        }
-                        let cell = SpatialCell { x, y, z };
-                        let Some(points) = self.cells.get(&cell) else {
-                            continue;
-                        };
-                        cells_visited += 1;
-                        for (index, point) in points.iter().enumerate() {
-                            let value = candidate_value(point.position, view, view_bounds, sigma);
-                            if value <= 0.0 {
-                                continue;
-                            }
-                            offers.push((
-                                value,
-                                LoadCandidate {
-                                    candidate: PendingCandidate { cell, index },
-                                },
-                            ));
-                        }
-                        if cells_visited >= BILLBOARD_PENDING_CELLS_PER_FRAME {
-                            break 'outward;
-                        }
+        while let Some(CellVisit { cell, .. }) = frontier.pop() {
+            lookups += 1;
+            offered.insert(cell);
+            if let Some(points) = self.cells.get(&cell) {
+                let offers_before = offers.len();
+                for (index, point) in points.iter().enumerate() {
+                    let value = valuation.of(point.position);
+                    if value <= 0.0 || !gate.admits(point, value) {
+                        continue;
                     }
+                    offers.push((
+                        value,
+                        LoadCandidate {
+                            candidate: PendingCandidate { cell, index },
+                        },
+                    ));
+                }
+                if offers.len() > offers_before {
+                    cells_offered += 1;
+                }
+            }
+            if cells_offered >= BILLBOARD_PENDING_CELLS_PER_FRAME
+                || lookups >= BILLBOARD_PENDING_CELL_LOOKUPS_PER_FRAME
+            {
+                break;
+            }
+            for neighbour in cell.face_neighbours() {
+                if self.contains_cell_range(neighbour) && queued.insert(neighbour) {
+                    frontier.push(CellVisit {
+                        bound: self.cell_value_bound(neighbour, valuation),
+                        cell: neighbour,
+                    });
                 }
             }
         }
+
+        let cell_volume = self.cell_size.powi(3);
+        let mut rng = Rng::new(seed ^ FAR_PROBE_SEED_SALT);
+        let far = self.farthest_cell_distance(view.position);
+        for probe in cone_probes(
+            view.position,
+            view.forward,
+            reference_distance.max(1.0),
+            far,
+            BILLBOARD_FAR_PROBES_PER_FRAME,
+            &mut rng,
+        ) {
+            let cell = self.cell_for(probe.position);
+            if !offered.insert(cell) {
+                continue;
+            }
+            let Some(points) = self.cells.get(&cell) else {
+                continue;
+            };
+            // Chance that at least one of this frame's probes lands in the
+            // cell, taking the density as constant across it.
+            let probed = 1.0
+                - (-(BILLBOARD_FAR_PROBES_PER_FRAME as f32) * cell_volume * probe.density).exp();
+            if probed <= 0.0 {
+                continue;
+            }
+            for (index, point) in points.iter().enumerate() {
+                let value = valuation.of(point.position);
+                if value <= 0.0 || !gate.admits(point, value) {
+                    continue;
+                }
+                offers.push((
+                    value / probed,
+                    LoadCandidate {
+                        candidate: PendingCandidate { cell, index },
+                    },
+                ));
+            }
+        }
+        self.walk_frontier = frontier;
+        self.walk_queued = queued;
+        self.walk_offered = offered;
 
         // A sparse streamed catalog can leave the camera with no populated
         // cell nearby; sample a bounded slice of the rest so those points are
@@ -1729,8 +2155,8 @@ impl SpatialPendingIndex {
                     continue;
                 };
                 for (index, point) in points.iter().enumerate() {
-                    let value = candidate_value(point.position, view, view_bounds, sigma);
-                    if value <= 0.0 {
+                    let value = valuation.of(point.position);
+                    if value <= 0.0 || !gate.admits(point, value) {
                         continue;
                     }
                     offers.push((
@@ -1883,9 +2309,9 @@ fn billboard_texture_limit(
     }
 }
 
-/// Weight of a candidate at `position`: the Gaussian "p score", measured
-/// from whichever of the camera's current and projected position is nearer,
-/// so an image being flown toward is weighted as though already close.
+/// Weight of a candidate at `position`: its [`load_utility`], measured from
+/// whichever of the camera's current and projected position is nearer, so
+/// an image being flown toward is weighted as though already close.
 ///
 /// Returns exactly zero outside the render boundary. That is not a cap on how
 /// far the sampler may reach — it is the fact that those points are hidden
@@ -1896,47 +2322,66 @@ fn candidate_value(
     position: Vec3,
     view: SchedulingView,
     view_bounds: &ViewBounds,
-    sigma: f32,
+    reference_distance: f32,
 ) -> f32 {
     if view_bounds.is_beyond(view.position, position) {
         return 0.0;
     }
-    load_value(
+    load_utility(
         view.approach_offset(position),
-        Vec3::ZERO,
         view.forward,
-        sigma,
+        reference_distance,
     )
 }
 
-fn pending_priority_score(position: Vec3, view: SchedulingView) -> f32 {
-    let to_point = view.approach_offset(position);
-    let distance = to_point.length().max(0.001);
-    let direction = to_point / distance;
-    let forward_alignment = direction.dot(view.forward);
-    let visibility_penalty = if forward_alignment >= 0.0 {
-        0.0
-    } else if forward_alignment >= BILLBOARD_NEAR_VISIBLE_DOT {
-        distance * 0.75
-    } else {
-        distance * 3.0
-    };
-    let screen_size_bonus = 1.0 / distance;
-
-    distance + visibility_penalty - (forward_alignment.max(0.0) * 2.0) - screen_size_bonus
+/// What a billboard is worth to the cache this frame: its
+/// [`candidate_value`].
+///
+/// Every cache decision reads this one number — which pending point to draw,
+/// which resident to evict, whether an arrival may displace a resident — so
+/// the three cannot disagree. When they used separate scores, the sampler
+/// proposed images the admission test refused, and eviction picked victims
+/// admission would have kept.
+#[derive(Clone, Copy)]
+struct Valuation<'a> {
+    view: SchedulingView,
+    bounds: &'a ViewBounds,
+    reference_distance: f32,
 }
 
-fn loaded_eviction_score(record: &LoadedBillboardRecord, view: SchedulingView) -> f32 {
-    let to_point = view.approach_offset(record.point.position);
-    let distance_squared = to_point.length_squared();
-    let direction = normalized_or(to_point, view.forward);
-    let forward_alignment = direction.dot(view.forward);
-    let visibility_penalty = if forward_alignment < BILLBOARD_NEAR_VISIBLE_DOT {
-        distance_squared * 2.0
-    } else {
-        0.0
-    };
-    distance_squared + visibility_penalty + record.texture_side as f32 * 0.001
+impl Valuation<'_> {
+    fn of(&self, position: Vec3) -> f32 {
+        candidate_value(position, self.view, self.bounds, self.reference_distance)
+    }
+}
+
+/// Which pending points the cache could take this frame. See
+/// [`ImageLoadingState::admission_gate`].
+#[derive(Clone, Copy)]
+struct AdmissionGate {
+    free_bytes: usize,
+    /// The value a candidate must exceed to start displacing the least
+    /// valuable resident; `INFINITY` with none resident, when only a point
+    /// that fits can be taken.
+    displacement_floor: f32,
+    texture_format: BillboardTextureFormat,
+}
+
+impl AdmissionGate {
+    /// Admits everything, for drawing without a cache to fill.
+    #[cfg(test)]
+    fn open() -> Self {
+        Self {
+            free_bytes: usize::MAX,
+            displacement_floor: f32::NEG_INFINITY,
+            texture_format: BillboardTextureFormat::default(),
+        }
+    }
+
+    fn admits(&self, point: &BillboardPoint, value: f32) -> bool {
+        point.texture_bytes(self.texture_format) <= self.free_bytes
+            || value > self.displacement_floor
+    }
 }
 
 /// Whether admitting `candidate` in place of `resident` improves the cache.
@@ -1949,10 +2394,33 @@ fn loaded_eviction_score(record: &LoadedBillboardRecord, view: SchedulingView) -
 fn replacement_improves_cache(
     candidate: &BillboardPoint,
     resident: &LoadedBillboardRecord,
-    view: SchedulingView,
+    valuation: Valuation,
+    bar: DisplacementBar,
 ) -> bool {
-    pending_priority_score(candidate.position, view)
-        < pending_priority_score(resident.point.position, view)
+    valuation.of(candidate.position) > valuation.of(resident.point.position) * bar.value_ratio()
+}
+
+/// How clearly a candidate must beat the residents it would displace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplacementBar {
+    /// Before a decode starts. Values change continuously as the camera
+    /// moves, so a swap between near-equals is often stale by the time its
+    /// decode lands, and the image it evicted is soon wanted back. Requiring
+    /// a clear margin spends decodes on swaps that are worth it — after a
+    /// turn, the image in view is worth thousands of times the one behind.
+    ToStart,
+    /// When a decode has landed. It is already paid for, so any improvement
+    /// is taken.
+    OnArrival,
+}
+
+impl DisplacementBar {
+    fn value_ratio(self) -> f32 {
+        match self {
+            Self::ToStart => BILLBOARD_REPLACEMENT_START_VALUE_RATIO,
+            Self::OnArrival => 1.0,
+        }
+    }
 }
 
 pub(crate) fn billboard_rotation(
@@ -2194,6 +2662,15 @@ mod tests {
         assert!((left.scale.y - 1.0).abs() < 1e-6);
     }
 
+    /// Values billboards from `view` at a scene scale of one unit per width.
+    fn unit_valuation(view: SchedulingView, bounds: &ViewBounds) -> Valuation<'_> {
+        Valuation {
+            view,
+            bounds,
+            reference_distance: 1.0,
+        }
+    }
+
     fn stationary_view(position: Vec3, forward: Vec3) -> SchedulingView {
         SchedulingView {
             position,
@@ -2224,10 +2701,176 @@ mod tests {
         capacity: usize,
         seed: u64,
     ) -> Vec<BillboardPoint> {
-        let sigma = load_value_sigma(navigation.reference_distance);
         let mut reservoir = WeightedReservoir::new(capacity, seed);
-        pending.offer_candidates(&mut reservoir, view, bounds, sigma);
+        let valuation = Valuation {
+            view,
+            bounds,
+            reference_distance: navigation.reference_distance,
+        };
+        pending.offer_candidates(&mut reservoir, valuation, AdmissionGate::open(), seed);
         pending.take_candidates(reservoir.take())
+    }
+
+    /// Where a full cache's draws go when the camera holds still: the
+    /// scenario behind "looking at billboards does not load them".
+    struct ReachReport {
+        /// Draws inside the 45° view cone, by distance in billboard widths.
+        /// The buckets reach past the grid's far corner, so none is a
+        /// catch-all.
+        ahead_by_distance: [usize; REACH_BUCKETS],
+        /// Pending billboards in each of those buckets, so a bucket's draws
+        /// can be read per billboard, free of how the grid happens to fill
+        /// each distance band.
+        ahead_population: [usize; REACH_BUCKETS],
+        side: usize,
+        behind: usize,
+        /// Draws the full cache would actually admit: the rest cost a worker
+        /// slot and do nothing.
+        admissible: usize,
+        draws: usize,
+        micros_per_frame: f64,
+    }
+
+    const REACH_BUCKETS: usize = 24;
+    const REACH_GRID_SIDE: i32 = 30;
+    /// Residents fill a hemisphere of this radius behind the camera, as they
+    /// would after loading while facing that way and then turning around.
+    const REACH_RESIDENT_RADIUS: f32 = 9.0;
+    const REACH_FRAMES: u64 = 10_000;
+    const REACH_DRAWS_PER_FRAME: usize = 8;
+
+    /// A dense grid, one billboard per width, with the camera at its centre
+    /// facing +X. The cache is exactly full of the residents behind it, and
+    /// every draw is rejected and returned to the index, so the report is
+    /// the scheduler's proposal distribution in that state, unchanged by
+    /// what it proposes.
+    fn measure_reach() -> ReachReport {
+        let half = REACH_GRID_SIDE / 2;
+        let forward = Vec3::X;
+        let (residents, pending): (Vec<_>, Vec<_>) = (0..REACH_GRID_SIDE.pow(3))
+            .map(|index| {
+                let x = index % REACH_GRID_SIDE - half;
+                let y = (index / REACH_GRID_SIDE) % REACH_GRID_SIDE - half;
+                let z = index / (REACH_GRID_SIDE * REACH_GRID_SIDE) - half;
+                // Offset by half a width so no billboard sits on the camera.
+                sized_point(
+                    index as usize,
+                    Vec3::new(x as f32, y as f32, z as f32) + Vec3::splat(0.5),
+                    512,
+                )
+            })
+            .partition(|point| {
+                point.position.dot(forward) < 0.0
+                    && point.position.length() <= REACH_RESIDENT_RADIUS
+            });
+        let mut state = ImageLoadingState::new(pending, 0, REACH_DRAWS_PER_FRAME, 0);
+        state.texture_format = BillboardTextureFormat::Bc7;
+        for point in residents {
+            state.loaded.insert(
+                point.image_id,
+                LoadedBillboardRecord {
+                    point,
+                    entity: Entity::PLACEHOLDER,
+                    texture_side: 512,
+                    texture_limit: 0,
+                    surface_assets: BillboardSurfaceAssets::default(),
+                },
+            );
+        }
+        state.texture_budget_bytes = state.committed_texture_bytes();
+        let view = stationary_view(Vec3::ZERO, forward);
+        let bounds = ViewBounds::default();
+        let cone_cos = std::f32::consts::FRAC_PI_4.cos();
+        let ahead_bucket = |position: Vec3| {
+            let offset = position - view.position;
+            (normalized_or(offset, forward).dot(forward) >= cone_cos)
+                .then(|| (offset.length() as usize).min(REACH_BUCKETS - 1))
+        };
+        let mut ahead_population = [0; REACH_BUCKETS];
+        for position in state.pending.positions() {
+            if let Some(bucket) = ahead_bucket(position) {
+                ahead_population[bucket] += 1;
+            }
+        }
+
+        let mut report = ReachReport {
+            ahead_by_distance: [0; REACH_BUCKETS],
+            ahead_population,
+            side: 0,
+            behind: 0,
+            admissible: 0,
+            draws: 0,
+            micros_per_frame: 0.0,
+        };
+        // Residents never change here, so neither does the order they would
+        // give up room in.
+        let valuation = Valuation {
+            view,
+            bounds: &bounds,
+            reference_distance: 1.0,
+        };
+        let eviction_order = state.eviction_order(valuation);
+        let mut drawing = Duration::ZERO;
+        for _ in 0..REACH_FRAMES {
+            let started = Instant::now();
+            let drawn = state.draw_load_candidates(valuation, REACH_DRAWS_PER_FRAME);
+            drawing += started.elapsed();
+            for point in drawn {
+                let alignment = normalized_or(point.position - view.position, forward).dot(forward);
+                if let Some(bucket) = ahead_bucket(point.position) {
+                    report.ahead_by_distance[bucket] += 1;
+                } else if alignment >= 0.0 {
+                    report.side += 1;
+                } else {
+                    report.behind += 1;
+                }
+                if state
+                    .replacement_victims(
+                        &point,
+                        valuation,
+                        &eviction_order,
+                        DisplacementBar::ToStart,
+                    )
+                    .is_some()
+                {
+                    report.admissible += 1;
+                }
+                report.draws += 1;
+                state.pending.insert(point);
+            }
+        }
+        report.micros_per_frame = drawing.as_secs_f64() * 1.0e6 / REACH_FRAMES as f64;
+        report
+    }
+
+    /// Prints [`measure_reach`]. Run with
+    /// `cargo test --release -p spatial_viewer --bin spatial_viewer reach_report -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement report, not a check"]
+    fn reach_report() {
+        let report = measure_reach();
+        let share = |count: usize| 100.0 * count as f64 / report.draws.max(1) as f64;
+        println!(
+            "draws {}  cost {:.1} us/frame",
+            report.draws, report.micros_per_frame
+        );
+        println!(
+            "behind {:.1}%  side {:.1}%  admissible {:.1}%",
+            share(report.behind),
+            share(report.side),
+            share(report.admissible)
+        );
+        for (distance, (count, population)) in report
+            .ahead_by_distance
+            .iter()
+            .zip(report.ahead_population)
+            .enumerate()
+        {
+            println!(
+                "ahead {distance:2}: {count}  per-billboard {:.3}",
+                *count as f64 / population.max(1) as f64
+            );
+        }
     }
 
     #[test]
@@ -2366,6 +3009,7 @@ mod tests {
                 point,
                 texture_limit: 0,
                 cancel: cancel.clone(),
+                reserved_victims: Vec::new(),
             },
         );
         let mut bounds = ViewBounds::default();
@@ -2494,15 +3138,14 @@ mod tests {
                 },
             );
         }
-        assert_eq!(state.loaded_bytes_used(), 3 * 1024 * 1024);
+        assert_eq!(state.committed_texture_bytes(), 3 * 1024 * 1024);
         assert!(state.cache_over_limit());
 
         // Evicting the worst-placed resident is enough to fit the budget,
         // and the farthest one is the one that goes.
         let view = stationary_view(Vec3::ZERO, Vec3::Z);
-        let farthest = state
-            .farthest_loaded_billboard(view)
-            .expect("a resident to evict");
+        let bounds = ViewBounds::default();
+        let farthest = state.eviction_order(unit_valuation(view, &bounds))[0];
         assert_eq!(farthest, 3, "the farthest billboard is evicted first");
         state.loaded.remove(&farthest);
         assert!(!state.cache_over_limit());
@@ -2525,7 +3168,7 @@ mod tests {
             },
         );
 
-        assert!(state.loaded_bytes_used() > state.texture_budget_bytes);
+        assert!(state.committed_texture_bytes() > state.texture_budget_bytes);
         assert!(
             !state.cache_over_limit(),
             "the last resident is never evicted"
@@ -2560,12 +3203,166 @@ mod tests {
             surface_assets: BillboardSurfaceAssets::default(),
         };
 
-        assert!(replacement_improves_cache(&candidate, &resident, view));
+        let bounds = ViewBounds::default();
+        let valuation = unit_valuation(view, &bounds);
+        for bar in [DisplacementBar::ToStart, DisplacementBar::OnArrival] {
+            assert!(replacement_improves_cache(
+                &candidate, &resident, valuation, bar
+            ));
+            assert!(!replacement_improves_cache(
+                &resident.point,
+                &resident,
+                valuation,
+                bar
+            ));
+        }
+    }
+
+    #[test]
+    fn a_marginal_swap_is_not_started_but_is_taken_once_paid_for() {
+        // A candidate slightly nearer than the resident is worth a little
+        // more: not enough to spend a decode on, but enough to keep if its
+        // decode has already landed.
+        let view = stationary_view(Vec3::ZERO, Vec3::Z);
+        let bounds = ViewBounds::default();
+        let valuation = unit_valuation(view, &bounds);
+        let candidate = test_point(2, Vec3::Z * 9.5);
+        let resident = LoadedBillboardRecord {
+            point: test_point(1, Vec3::Z * 10.0),
+            entity: Entity::PLACEHOLDER,
+            texture_side: 64,
+            texture_limit: 0,
+            surface_assets: BillboardSurfaceAssets::default(),
+        };
+        let ratio = valuation.of(candidate.position) / valuation.of(resident.point.position);
+        assert!(ratio > 1.0 && ratio < BILLBOARD_REPLACEMENT_START_VALUE_RATIO);
+
         assert!(!replacement_improves_cache(
-            &resident.point,
+            &candidate,
             &resident,
-            view
+            valuation,
+            DisplacementBar::ToStart
         ));
+        assert!(replacement_improves_cache(
+            &candidate,
+            &resident,
+            valuation,
+            DisplacementBar::OnArrival
+        ));
+    }
+
+    #[test]
+    fn a_cell_bound_is_never_below_the_value_of_a_point_inside_it() {
+        // The walk visits cells in order of this bound and stops at its
+        // budget, so a bound below a point's real value could skip the
+        // cell that matters most.
+        let index = SpatialPendingIndex::new(vec![
+            test_point(1, Vec3::splat(-8.0)),
+            test_point(2, Vec3::splat(8.0)),
+        ]);
+        let bounds = ViewBounds::default();
+        let mut rng = crate::load_sampling::Rng::new(11);
+        let mut unit = || rng.next_unit();
+        for _ in 0..400 {
+            let position = Vec3::new(unit(), unit(), unit()) * 16.0 - 8.0;
+            let forward = (Vec3::new(unit(), unit(), unit()) - 0.5).normalize_or(Vec3::Z);
+            let lookahead = position + (Vec3::new(unit(), unit(), unit()) - 0.5) * 4.0;
+            let view = SchedulingView {
+                position,
+                forward,
+                lookahead_position: lookahead,
+            };
+            let valuation = unit_valuation(view, &bounds);
+            let cell = SpatialCell {
+                x: (unit() * 8.0) as i32 - 4,
+                y: (unit() * 8.0) as i32 - 4,
+                z: (unit() * 8.0) as i32 - 4,
+            };
+            let bound = index.cell_value_bound(cell, valuation);
+            let corner = Vec3::new(cell.x as f32, cell.y as f32, cell.z as f32) * index.cell_size;
+            for _ in 0..20 {
+                let inside = corner + Vec3::new(unit(), unit(), unit()) * index.cell_size;
+                let value = valuation.of(inside);
+                assert!(
+                    value <= bound * (1.0 + 1e-4),
+                    "point worth {value} in a cell bounded at {bound}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cell_beyond_the_render_boundary_is_worth_nothing() {
+        let index = SpatialPendingIndex::new(vec![test_point(1, Vec3::ZERO)]);
+        let mut bounds = ViewBounds::default();
+        bounds.radius = 10.0;
+        let valuation = unit_valuation(stationary_view(Vec3::ZERO, Vec3::Z), &bounds);
+        let beyond = index.cell_for(Vec3::Z * 30.0);
+        let within = index.cell_for(Vec3::Z * 5.0);
+
+        assert_eq!(index.cell_value_bound(beyond, valuation), 0.0);
+        assert!(index.cell_value_bound(within, valuation) > 0.0);
+    }
+
+    #[test]
+    fn a_resident_behind_the_camera_is_evicted_before_a_farther_one_ahead() {
+        // The billboard you are looking at, even far off, is worth more than
+        // one close behind you: the old eviction score had this backwards.
+        let mut state = ImageLoadingState::new(Vec::new(), 0, 4, 0);
+        for (image_id, position) in [(1usize, Vec3::NEG_Z * 3.0), (2, Vec3::Z * 6.0)] {
+            state.loaded.insert(
+                image_id,
+                LoadedBillboardRecord {
+                    point: test_point(image_id, position),
+                    entity: Entity::PLACEHOLDER,
+                    texture_side: 64,
+                    texture_limit: 0,
+                    surface_assets: BillboardSurfaceAssets::default(),
+                },
+            );
+        }
+        let bounds = ViewBounds::default();
+        let view = stationary_view(Vec3::ZERO, Vec3::Z);
+
+        assert_eq!(
+            state.eviction_order(unit_valuation(view, &bounds)),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn a_full_cache_only_draws_candidates_that_could_displace_a_resident() {
+        // One resident ahead fills the budget exactly. Behind the camera,
+        // a candidate nearer than it is still worth less, so it can never
+        // be admitted and must never take a worker; the candidates ahead
+        // of the resident are the only draws.
+        let resident = sized_point(1, Vec3::Z * 4.0, 512);
+        let worth_less = sized_point(2, Vec3::NEG_Z * 2.0, 512);
+        let worth_more = sized_point(3, Vec3::Z * 2.0, 512);
+        let mut state = ImageLoadingState::new(vec![worth_less, worth_more], 0, 4, 0);
+        state.texture_format = BillboardTextureFormat::Bc7;
+        state.loaded.insert(
+            resident.image_id,
+            LoadedBillboardRecord {
+                point: resident,
+                entity: Entity::PLACEHOLDER,
+                texture_side: 512,
+                texture_limit: 0,
+                surface_assets: BillboardSurfaceAssets::default(),
+            },
+        );
+        state.texture_budget_bytes = state.committed_texture_bytes();
+        let bounds = ViewBounds::default();
+        let valuation = unit_valuation(stationary_view(Vec3::ZERO, Vec3::Z), &bounds);
+
+        for _ in 0..50 {
+            let drawn = state.draw_load_candidates(valuation, 4);
+            let ids = drawn.iter().map(|point| point.image_id).collect::<Vec<_>>();
+            assert_eq!(ids, vec![3]);
+            for point in drawn {
+                state.pending.insert(point);
+            }
+        }
     }
 
     #[test]
@@ -2588,6 +3385,7 @@ mod tests {
                 point: test_point(2, Vec3::Z * 5.0),
                 texture_limit: 64,
                 cancel: CancelToken::new(),
+                reserved_victims: Vec::new(),
             },
         );
 
@@ -2596,7 +3394,7 @@ mod tests {
         // The in-flight replacement is charged against the budget before it
         // lands, so a burst of scheduling cannot overshoot on arrival.
         assert_eq!(
-            state.loaded_bytes_used(),
+            state.committed_texture_bytes(),
             2 * billboard_surface_bytes(
                 UVec2::splat(BILLBOARD_UNKNOWN_SOURCE_SIDE),
                 BillboardTextureFormat::default(),
@@ -2604,10 +3402,137 @@ mod tests {
         );
     }
 
+    /// Runs one `schedule_image_loads` pass with a `budget_mib` texture
+    /// budget and `decode_slots` decode workers. With no camera, the view
+    /// sits at the origin looking down +Z.
+    fn schedule_once(
+        state: ImageLoadingState,
+        budget_mib: u32,
+        decode_slots: usize,
+    ) -> ImageLoadingState {
+        let mut pause_menu = PauseMenuState::default();
+        pause_menu.resume();
+
+        let mut app = App::new();
+        app.insert_resource(state)
+            .insert_resource(BillboardControls::new(budget_mib, 1024))
+            .insert_resource(pause_menu)
+            .insert_resource(NavigationSettings::new(4.0, 10.0))
+            .insert_resource(ViewBounds::default())
+            .insert_resource(BillboardTextureEncoding::default())
+            .insert_resource(DecodeBudget::new(decode_slots))
+            .init_resource::<VideoControlsState>()
+            .insert_resource(MediaSettings::in_memory())
+            .init_resource::<PlaybackSettings>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<PointCloud>()
+            .add_systems(Update, schedule_image_loads);
+        app.update();
+        app.world_mut()
+            .remove_resource::<ImageLoadingState>()
+            .expect("the loading state outlives the pass")
+    }
+
+    fn resident_record(point: BillboardPoint) -> LoadedBillboardRecord {
+        LoadedBillboardRecord {
+            point,
+            entity: Entity::PLACEHOLDER,
+            texture_side: 512,
+            texture_limit: 0,
+            surface_assets: BillboardSurfaceAssets::default(),
+        }
+    }
+
+    #[test]
+    fn a_full_cache_runs_several_replacements_at_once_on_disjoint_residents() {
+        // Two 512px RGBA8 residents (1 MiB each) fill a 2 MiB budget, and
+        // two nearer candidates each need one of them gone. Both decodes
+        // start in the same pass, each reserving a different resident, and
+        // both residents stay on screen until their replacements land.
+        let mut state = ImageLoadingState::new(
+            vec![
+                sized_point(11, Vec3::Z * 2.0, 512),
+                sized_point(12, Vec3::Z * 3.0, 512),
+            ],
+            0,
+            4,
+            1024,
+        );
+        for (image_id, distance) in [(1usize, 40.0f32), (2, 50.0)] {
+            state.loaded.insert(
+                image_id,
+                resident_record(sized_point(image_id, Vec3::Z * distance, 512)),
+            );
+        }
+
+        let state = schedule_once(state, 2, 4);
+
+        assert!(state.in_flight.contains_key(&11));
+        assert!(state.in_flight.contains_key(&12));
+        assert_eq!(
+            state.loaded.len(),
+            2,
+            "no resident leaves before its replacement lands"
+        );
+        let mut reserved = state
+            .in_flight
+            .values()
+            .flat_map(|load| load.reserved_victims.clone())
+            .collect::<Vec<_>>();
+        reserved.sort();
+        assert_eq!(reserved, vec![1, 2]);
+        assert!(state.committed_texture_bytes() <= state.texture_budget_bytes);
+        assert!(!state.cache_over_limit());
+    }
+
+    #[test]
+    fn a_reserved_resident_is_neither_double_booked_nor_evicted_early() {
+        // Resident 1 is reserved by in-flight load 9, which credits its room
+        // to the budget: the cache is exactly full, not over. A third
+        // candidate must not count on resident 1's room as well, and with
+        // no other resident it cannot be admitted.
+        let mut state = ImageLoadingState::new(Vec::new(), 0, 4, 0);
+        state.texture_format = BillboardTextureFormat::Bc7;
+        state
+            .loaded
+            .insert(1, resident_record(sized_point(1, Vec3::Z * 40.0, 512)));
+        state.in_flight.insert(
+            9,
+            InFlightLoad {
+                point: sized_point(9, Vec3::Z * 2.0, 512),
+                texture_limit: 0,
+                cancel: CancelToken::new(),
+                reserved_victims: vec![1],
+            },
+        );
+        state.texture_budget_bytes =
+            sized_point(0, Vec3::ZERO, 512).texture_bytes(BillboardTextureFormat::Bc7);
+
+        assert_eq!(state.committed_texture_bytes(), state.texture_budget_bytes);
+        assert!(!state.cache_over_limit());
+        let bounds = ViewBounds::default();
+        let valuation = unit_valuation(stationary_view(Vec3::ZERO, Vec3::Z), &bounds);
+        let order = state.eviction_order(valuation);
+        assert_eq!(
+            state.replacement_victims(
+                &sized_point(10, Vec3::Z * 3.0, 512),
+                valuation,
+                &order,
+                DisplacementBar::OnArrival
+            ),
+            None
+        );
+    }
+
     #[test]
     fn full_cache_schedules_nearer_candidate_without_evicting_resident() {
-        let resident = test_point(1, Vec3::Z * 100.0);
-        let candidate = test_point(2, Vec3::Z * 5.0);
+        // 512px RGBA8 is exactly the 1 MiB budget the controls below set, so
+        // the resident fills the cache and the candidate fits only in its
+        // place. A candidate larger than the whole budget could never land
+        // and must not be scheduled at all.
+        let resident = sized_point(1, Vec3::Z * 100.0, 512);
+        let candidate = sized_point(2, Vec3::Z * 5.0, 512);
         let mut state = ImageLoadingState::new(vec![candidate], 1, 2, 1024);
         state.loaded.insert(
             resident.image_id,
@@ -2619,31 +3544,128 @@ mod tests {
                 surface_assets: BillboardSurfaceAssets::default(),
             },
         );
-        let mut pause_menu = PauseMenuState::default();
-        pause_menu.resume();
-
-        let mut app = App::new();
-        app.insert_resource(state)
-            .insert_resource(BillboardControls::new(1, 1024))
-            .insert_resource(pause_menu)
-            .insert_resource(NavigationSettings::new(4.0, 10.0))
-            .insert_resource(ViewBounds::default())
-            .insert_resource(BillboardTextureEncoding::default())
-            .insert_resource(DecodeBudget::new(2))
-            .init_resource::<VideoControlsState>()
-            .insert_resource(MediaSettings::in_memory())
-            .init_resource::<PlaybackSettings>()
-            .init_resource::<Assets<Image>>()
-            .init_resource::<Assets<StandardMaterial>>()
-            .init_resource::<PointCloud>()
-            .add_systems(Update, schedule_image_loads);
-
-        app.update();
-
-        let state = app.world().resource::<ImageLoadingState>();
+        let state = schedule_once(state, 1, 2);
         assert!(state.in_flight.contains_key(&2));
         assert!(state.loaded.contains_key(&1));
         assert_eq!(state.loaded.len(), 1);
+    }
+
+    /// Makes `residents` resident, hands `point` to the receiving system as a
+    /// finished decode the way a worker would, then runs one receive pass.
+    /// With no camera, the scheduling view sits at the origin looking down
+    /// +Z.
+    fn receive_decoded(
+        mut state: ImageLoadingState,
+        residents: Vec<BillboardPoint>,
+        point: BillboardPoint,
+    ) -> ImageLoadingState {
+        let mut app = App::new();
+        // Eviction despawns a resident's entity, so each needs a real one.
+        for resident in residents {
+            let side = resident.source_size.map_or(0, |size| size.max_element());
+            state.loaded.insert(
+                resident.image_id,
+                LoadedBillboardRecord {
+                    point: resident,
+                    entity: app.world_mut().spawn_empty().id(),
+                    texture_side: side,
+                    texture_limit: 0,
+                    surface_assets: BillboardSurfaceAssets::default(),
+                },
+            );
+        }
+        let side = point.source_size.map_or(0, |size| size.max_element());
+        state.in_flight.insert(
+            point.image_id,
+            InFlightLoad {
+                point: point.clone(),
+                texture_limit: 0,
+                cancel: CancelToken::new(),
+                reserved_victims: Vec::new(),
+            },
+        );
+        state.completed.push(ImageLoadResult {
+            point,
+            texture_limit: 0,
+            encode_tally: SurfaceEncodeTally::default(),
+            encode_tally_counted: false,
+            result: Ok(DecodedBillboardImage {
+                side,
+                surface: None,
+                encode_tally: SurfaceEncodeTally::default(),
+            }),
+            cancelled: false,
+            uploaded_surface: None,
+        });
+        let mut pause_menu = PauseMenuState::default();
+        pause_menu.resume();
+
+        app.insert_resource(state)
+            .insert_resource(pause_menu)
+            .insert_resource(BillboardMesh(Handle::default()))
+            .insert_resource(BillboardWorldSize(1.0))
+            .insert_resource(NavigationSettings::new(4.0, 10.0))
+            .insert_resource(ViewBounds::default())
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<PointCloud>()
+            .add_systems(Update, receive_image_loads);
+        app.update();
+        app.world_mut()
+            .remove_resource::<ImageLoadingState>()
+            .expect("the loading state outlives the pass")
+    }
+
+    #[test]
+    fn an_arrival_evicts_as_many_worse_residents_as_it_needs_room_for() {
+        // Four 512px BC7 residents (256 KiB each) fill a 1 MiB budget. A
+        // nearer 1024px image (1 MiB) needs all four gone, and is better
+        // placed than each of them.
+        let mut state = ImageLoadingState::new(Vec::new(), 1024 * 1024, 4, 0);
+        state.texture_format = BillboardTextureFormat::Bc7;
+        let residents = [(1usize, 100.0f32), (2, 110.0), (3, 120.0), (4, 130.0)]
+            .map(|(image_id, distance)| sized_point(image_id, Vec3::Z * distance, 512))
+            .to_vec();
+
+        let state = receive_decoded(state, residents, sized_point(9, Vec3::Z * 5.0, 1024));
+
+        assert!(
+            state.loaded.contains_key(&9),
+            "the arrival must land once enough worse residents make room"
+        );
+        assert_eq!(state.loaded.len(), 1);
+        assert!(state.committed_texture_bytes() <= state.texture_budget_bytes);
+        assert_eq!(state.cache_churn.evicted_for_arrivals, 4);
+        assert_eq!(state.cache_churn.discarded_decodes, 0);
+    }
+
+    #[test]
+    fn an_arrival_that_cannot_make_room_evicts_nothing() {
+        // Making room for the 1024px arrival would mean evicting the 512px
+        // resident in front of it too. It cannot displace a better-placed
+        // image, so it is dropped — and the farther resident, which alone
+        // could never have made room, must not be evicted on the way.
+        let mut state = ImageLoadingState::new(Vec::new(), 1024 * 1024, 4, 0);
+        state.texture_format = BillboardTextureFormat::Bc7;
+        let residents = vec![
+            sized_point(1, Vec3::Z * 3.0, 512),
+            sized_point(2, Vec3::Z * 100.0, 512),
+        ];
+
+        let state = receive_decoded(state, residents, sized_point(9, Vec3::Z * 5.0, 1024));
+
+        assert!(!state.loaded.contains_key(&9));
+        assert!(state.loaded.contains_key(&1));
+        assert!(
+            state.loaded.contains_key(&2),
+            "a resident evicted for an arrival that is then dropped is pure churn"
+        );
+        assert_eq!(state.cache_churn.evictions(), 0);
+        assert_eq!(state.cache_churn.discarded_decodes, 1);
+        assert!(
+            state.pending.ids.contains(&9),
+            "a dropped arrival stays schedulable"
+        );
     }
 
     #[test]
@@ -2664,15 +3686,15 @@ mod tests {
     fn points_behind_the_camera_keep_a_small_but_real_weight() {
         let view = stationary_view(Vec3::ZERO, Vec3::Z);
         let bounds = ViewBounds::default();
-        let sigma = load_value_sigma(10.0);
+        let reference_distance = 10.0;
 
         // The old scheduler deferred everything behind the camera outside a
         // fixed buffer radius. The sampler instead down-weights it: a
         // turn-around still finds a warm cache, and distance decides the odds
         // rather than a hard radius.
-        let just_behind = candidate_value(Vec3::NEG_Z * 20.0, view, &bounds, sigma);
-        let far_behind = candidate_value(Vec3::NEG_Z * 250.0, view, &bounds, sigma);
-        let ahead = candidate_value(Vec3::Z * 20.0, view, &bounds, sigma);
+        let just_behind = candidate_value(Vec3::NEG_Z * 20.0, view, &bounds, reference_distance);
+        let far_behind = candidate_value(Vec3::NEG_Z * 250.0, view, &bounds, reference_distance);
+        let ahead = candidate_value(Vec3::Z * 20.0, view, &bounds, reference_distance);
 
         assert!(ahead > just_behind);
         assert!(just_behind > far_behind);
